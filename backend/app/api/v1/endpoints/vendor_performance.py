@@ -15,7 +15,7 @@ from ....schemas.vendor_performance import (
     VendorPerformanceStatistics,
 )
 from ....services.vendor_performance import (
-    build_performance_list_item,
+    build_performance_list_items,
     build_vendor_performance,
     compute_performance_statistics,
     paginate_items,
@@ -71,7 +71,7 @@ async def list_vendor_performance(
             ]
 
     vendors = await find_docs(db, "vendors", Vendor, criteria)
-    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
+    items = await build_performance_list_items(db, vendors)
 
     if classification is not None:
         items = [item for item in items if item.classification == classification]

@@ -6,6 +6,7 @@ public risk response, as well as the risk list and statistics used by the
 the response says so explicitly.
 """
 
+import asyncio
 from datetime import datetime, timezone
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -117,8 +118,10 @@ async def build_predictive_risk(db: AsyncIOMotorDatabase, vendor: Vendor) -> Pre
 
 
 async def _build_list_item(db: AsyncIOMotorDatabase, vendor: Vendor) -> VendorRiskListItem:
-    risk = await build_predictive_risk(db, vendor)
-    overall = await _phase7_overall(db, vendor.id, None, None)
+    risk, overall = await asyncio.gather(
+        build_predictive_risk(db, vendor),
+        _phase7_overall(db, vendor.id, None, None),
+    )
     category_name = vendor.category.name if vendor.category else None
     return VendorRiskListItem(
         vendor_id=risk.vendor_id,
@@ -171,7 +174,9 @@ async def build_risk_list(
 
     vendors = await find_docs(db, "vendors", Vendor, criteria)
     await attach_categories(db, vendors)
-    items = [await _build_list_item(db, vendor) for vendor in vendors]
+    items = list(
+        await asyncio.gather(*[_build_list_item(db, vendor) for vendor in vendors])
+    )
 
     if risk_level is not None:
         items = [item for item in items if item.risk_level == risk_level]
@@ -209,7 +214,9 @@ async def build_risk_statistics(db: AsyncIOMotorDatabase) -> RiskStatistics:
     """Summary card statistics computed from every vendor's real risk data."""
     vendors = await find_docs(db, "vendors", Vendor, {})
     await attach_categories(db, vendors)
-    items = [await _build_list_item(db, vendor) for vendor in vendors]
+    items = list(
+        await asyncio.gather(*[_build_list_item(db, vendor) for vendor in vendors])
+    )
 
     stats = RiskStatistics(total_vendors=len(items))
     scored = []

@@ -127,6 +127,52 @@ def _score_delivery_rows(rows: list[tuple[date | None, date]]) -> tuple:
     return (score, total_orders, len(completed), on_time, delayed, True)
 
 
+def _delivery_subscore_from_pairs(
+    pairs: list[tuple[date | None, date]],
+) -> DeliveryPerformanceSubscore:
+    """Delivery subscore computed purely from ``(actual, expected)`` pairs."""
+    score, total_orders, completed, on_time, delayed, available = _score_delivery_rows(pairs)
+    return DeliveryPerformanceSubscore(
+        score=score,
+        total_orders=total_orders,
+        completed_deliveries=completed,
+        on_time_deliveries=on_time,
+        delayed_deliveries=delayed,
+        data_available=available,
+    )
+
+
+def _quality_subscore_from_values(values: list[int]) -> QualityPerformanceSubscore:
+    """Quality subscore computed purely from quality evaluation scores."""
+    average, total = _score_quality_values(values)
+    return QualityPerformanceSubscore(
+        score=average,
+        total_evaluations=total,
+        average_quality_score=average,
+        data_available=total > 0,
+    )
+
+
+def _incident_subscore_from_rows(incidents: list[Incident]) -> IncidentPerformanceSubscore:
+    """Incident subscore computed purely from incident models."""
+    result = _score_incident_rows(incidents)
+    counts = result["counts"]
+    return IncidentPerformanceSubscore(
+        score=result["score"],
+        total_incidents=len(incidents),
+        open=counts["open"],
+        in_progress=counts["in_progress"],
+        resolved=counts["resolved"],
+        closed=counts["closed"],
+        critical=counts["critical"],
+        high=counts["high"],
+        medium=counts["medium"],
+        low=counts["low"],
+        overdue=counts["overdue"],
+        data_available=True,
+    )
+
+
 async def compute_delivery_score(
     db: AsyncIOMotorDatabase,
     vendor_id: int | None = None,
@@ -163,15 +209,7 @@ async def compute_delivery_score(
         )
         for row in rows
     ]
-    score, total_orders, completed, on_time, delayed, available = _score_delivery_rows(pairs)
-    return DeliveryPerformanceSubscore(
-        score=score,
-        total_orders=total_orders,
-        completed_deliveries=completed,
-        on_time_deliveries=on_time,
-        delayed_deliveries=delayed,
-        data_available=available,
-    )
+    return _delivery_subscore_from_pairs(pairs)
 
 
 def _score_quality_values(values: list[int]) -> tuple[float | None, int]:
@@ -200,13 +238,7 @@ async def compute_quality_score(
         criteria,
         project={"quality_score": 1, "_id": 0},
     )
-    average, total = _score_quality_values([row["quality_score"] for row in rows])
-    return QualityPerformanceSubscore(
-        score=average,
-        total_evaluations=total,
-        average_quality_score=average,
-        data_available=total > 0,
-    )
+    return _quality_subscore_from_values([row["quality_score"] for row in rows])
 
 
 def _score_incident_rows(incidents: list[Incident]) -> dict:
@@ -283,23 +315,7 @@ async def compute_incident_score(
     """
     criteria = _column_criteria(vendor_id, start_date, end_date, "reported_date")
     incidents = await find_docs(db, "incidents", Incident, criteria)
-    result = _score_incident_rows(incidents)
-    score = result["score"]
-    counts = result["counts"]
-    return IncidentPerformanceSubscore(
-        score=score,
-        total_incidents=len(incidents),
-        open=counts["open"],
-        in_progress=counts["in_progress"],
-        resolved=counts["resolved"],
-        closed=counts["closed"],
-        critical=counts["critical"],
-        high=counts["high"],
-        medium=counts["medium"],
-        low=counts["low"],
-        overdue=counts["overdue"],
-        data_available=True,
-    )
+    return _incident_subscore_from_rows(incidents)
 
 
 def _combine_scores(
@@ -494,6 +510,32 @@ async def build_vendor_performance(
     )
 
 
+def _performance_item_from_subscores(
+    vendor: Vendor,
+    delivery: DeliveryPerformanceSubscore,
+    quality: QualityPerformanceSubscore,
+    incidents: IncidentPerformanceSubscore,
+) -> VendorPerformanceListItem:
+    """Compact list representation derived from pre-computed subscores."""
+    overall, confidence, limited, available, missing = _combine_scores(
+        vendor, delivery, quality, incidents
+    )
+    return VendorPerformanceListItem(
+        vendor_id=vendor.id,
+        vendor_name=vendor.company_name,
+        vendor_code=vendor.vendor_code,
+        overall_score=overall,
+        classification=classify_performance(overall),
+        limited_data=limited,
+        data_confidence=confidence,
+        delivery_score=delivery.score,
+        quality_score=quality.score,
+        incident_score=incidents.score,
+        available_components=available,
+        missing_components=missing,
+    )
+
+
 async def build_performance_list_item(
     db: AsyncIOMotorDatabase,
     vendor: Vendor,
@@ -504,26 +546,98 @@ async def build_performance_list_item(
 
     ``start_date``/``end_date`` optionally scope component data to a period.
     """
-    detail = await build_vendor_performance(db, vendor, start_date, end_date)
-    return VendorPerformanceListItem(
-        vendor_id=detail.vendor_id,
-        vendor_name=detail.vendor_name,
-        vendor_code=detail.vendor_code,
-        overall_score=detail.overall_score,
-        classification=detail.classification,
-        limited_data=detail.limited_data,
-        data_confidence=detail.data_confidence,
-        delivery_score=detail.delivery.score,
-        quality_score=detail.quality.score,
-        incident_score=detail.incidents.score,
-        available_components=detail.available_components,
-        missing_components=detail.missing_components,
+    delivery = await compute_delivery_score(db, vendor.id, start_date, end_date)
+    quality = await compute_quality_score(db, vendor.id, start_date, end_date)
+    incidents = await compute_incident_score(db, vendor.id, start_date, end_date)
+    return _performance_item_from_subscores(vendor, delivery, quality, incidents)
+
+
+async def build_performance_list_items(
+    db: AsyncIOMotorDatabase,
+    vendors: list[Vendor],
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> list[VendorPerformanceListItem]:
+    """Compute list representations for many vendors with 3 queries total.
+
+    Replaces the per-vendor N+1 pattern (which issued 3 sequential queries per
+    vendor) with one query per source collection, followed by pure in-memory
+    scoring — identical math, far fewer round trips.
+    """
+    if not vendors:
+        return []
+    vendor_ids = [vendor.id for vendor in vendors]
+    in_clause = {"vendor_id": {"$in": vendor_ids}}
+
+    delivery_criteria = _column_criteria(None, start_date, end_date, "order_date")
+    delivery_criteria.update(in_clause)
+    delivery_docs = await find_docs(
+        db,
+        "purchase_orders",
+        None,
+        delivery_criteria,
+        project={
+            "vendor_id": 1,
+            "actual_delivery_date": 1,
+            "expected_delivery_date": 1,
+            "_id": 0,
+        },
     )
+    delivery_by_vendor: dict[int, list[tuple[date | None, date]]] = {}
+    for row in delivery_docs:
+        delivery_by_vendor.setdefault(row["vendor_id"], []).append(
+            (
+                date.fromisoformat(row["actual_delivery_date"])
+                if row.get("actual_delivery_date")
+                else None,
+                date.fromisoformat(row["expected_delivery_date"])
+                if row.get("expected_delivery_date")
+                else None,
+            )
+        )
+
+    quality_criteria = _column_criteria(None, start_date, end_date, "evaluation_date")
+    quality_criteria.update(in_clause)
+    quality_docs = await find_docs(
+        db,
+        "quality_evaluations",
+        None,
+        quality_criteria,
+        project={"vendor_id": 1, "quality_score": 1, "_id": 0},
+    )
+    quality_by_vendor: dict[int, list[int]] = {}
+    for row in quality_docs:
+        quality_by_vendor.setdefault(row["vendor_id"], []).append(row["quality_score"])
+
+    incident_criteria = _column_criteria(None, start_date, end_date, "reported_date")
+    incident_criteria.update(in_clause)
+    incident_docs = await find_docs(db, "incidents", Incident, incident_criteria)
+    incidents_by_vendor: dict[int, list[Incident]] = {}
+    for incident in incident_docs:
+        incidents_by_vendor.setdefault(incident.vendor_id, []).append(incident)
+
+    items: list[VendorPerformanceListItem] = []
+    for vendor in vendors:
+        delivery = _delivery_subscore_from_pairs(
+            delivery_by_vendor.get(vendor.id, [])
+        )
+        quality = _quality_subscore_from_values(
+            quality_by_vendor.get(vendor.id, [])
+        )
+        incidents = _incident_subscore_from_rows(
+            incidents_by_vendor.get(vendor.id, [])
+        )
+        items.append(_performance_item_from_subscores(vendor, delivery, quality, incidents))
+    return items
 
 
-async def compute_performance_statistics(db: AsyncIOMotorDatabase) -> VendorPerformanceStatistics:
+async def compute_performance_statistics(
+    db: AsyncIOMotorDatabase, vendors: list[Vendor] | None = None
+) -> VendorPerformanceStatistics:
     """Statistics for the performance dashboard cards (real data only)."""
-    vendors = await find_docs(db, "vendors", Vendor, {})
+    if vendors is None:
+        vendors = await find_docs(db, "vendors", Vendor, {})
+    items = await build_performance_list_items(db, vendors)
     counts: dict[VendorPerformanceClassification, int] = {
         VendorPerformanceClassification.EXCELLENT: 0,
         VendorPerformanceClassification.GOOD: 0,
@@ -533,13 +647,12 @@ async def compute_performance_statistics(db: AsyncIOMotorDatabase) -> VendorPerf
         VendorPerformanceClassification.INSUFFICIENT_DATA: 0,
     }
     limited_data = 0
-    for vendor in vendors:
-        item = await build_performance_list_item(db, vendor)
+    for item in items:
         counts[item.classification] += 1
         if item.limited_data:
             limited_data += 1
     return VendorPerformanceStatistics(
-        total_vendors=len(vendors),
+        total_vendors=len(items),
         excellent=counts[VendorPerformanceClassification.EXCELLENT],
         good=counts[VendorPerformanceClassification.GOOD],
         average=counts[VendorPerformanceClassification.AVERAGE],

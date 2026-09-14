@@ -12,6 +12,7 @@ no operational records at all reports no risk score instead of fabricating a
 zero.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -25,6 +26,11 @@ from ..models.enums import (
     RiskTrend,
 )
 from ..schemas.predictive_risk import PositiveFactor, RiskFactor
+from ..schemas.vendor_performance import (
+    DeliveryPerformanceSubscore,
+    IncidentPerformanceSubscore,
+    QualityPerformanceSubscore,
+)
 from .ml import risk_config
 from .vendor_performance import (
     compute_delivery_score,
@@ -103,18 +109,25 @@ async def compute_rule_based_components(
     vendor: Vendor,
     start: date | None,
     end: date | None,
-) -> tuple[dict[str, ComponentRisk], float | None]:
-    """Component risks for ``vendor`` over ``[start, end]`` and combined score.
+) -> tuple[dict[str, ComponentRisk], float | None, int]:
+    """Component risks for ``vendor`` over ``[start, end]`` plus record counts.
 
-    Returns (components, combined_risk_score). The combined score is ``None``
-    when no component has data (the record-gating rule).
+    Returns ``(components, combined_risk_score, total_records)``. The combined
+    score is ``None`` when no component has data (the record-gating rule).
     """
-    delivery = await compute_delivery_score(db, vendor.id, start, end)
-    quality = await compute_quality_score(db, vendor.id, start, end)
-    incidents = await compute_incident_score(db, vendor.id, start, end)
-
     span_end = end or date.today()
-    outstanding, recent = await compute_workload_components(db, vendor.id, span_end)
+    delivery, quality, incidents, workload = await asyncio.gather(
+        compute_delivery_score(db, vendor.id, start, end),
+        compute_quality_score(db, vendor.id, start, end),
+        compute_incident_score(db, vendor.id, start, end),
+        compute_workload_components(db, vendor.id, span_end),
+    )
+    outstanding, recent = workload
+    total_records = (
+        delivery.total_orders
+        + quality.total_evaluations
+        + incidents.total_incidents
+    )
 
     components: dict[str, ComponentRisk] = {}
 
@@ -146,11 +159,7 @@ async def compute_rule_based_components(
             ),
         )
 
-    has_records = (
-        delivery.total_orders
-        + quality.total_evaluations
-        + incidents.total_incidents
-    ) > 0
+    has_records = total_records > 0
     incident_available = incidents.data_available and has_records
     if incident_available:
         incident_risk = _clamp01(100.0 - incidents.score)
@@ -171,7 +180,7 @@ async def compute_rule_based_components(
 
     if any(name in components for name in ("delivery", "quality", "incident")):
         # Overall performance risk mirrors the Phase 7 overall score.
-        overall = await _phase7_overall(db, vendor.id, start, end)
+        overall = _phase7_overall_from_subscores(delivery, quality, incidents)
         if overall is not None:
             performance_risk = _clamp01(100.0 - overall)
             components["performance"] = ComponentRisk(
@@ -200,18 +209,16 @@ async def compute_rule_based_components(
         )
 
     combined = _combine_risks(components)
-    return components, combined
+    return components, combined, total_records
 
 
-async def _phase7_overall(
-    db: AsyncIOMotorDatabase, vendor_id: int, start: date | None, end: date | None
+def _phase7_overall_from_subscores(
+    delivery: DeliveryPerformanceSubscore,
+    quality: QualityPerformanceSubscore,
+    incidents: IncidentPerformanceSubscore,
 ) -> float | None:
-    """Phase 7 overall performance score (delivery/quality/incident blend)."""
+    """Phase 7 overall performance score from already-fetched subscores."""
     from .vendor_performance import COMPONENT_WEIGHTS
-
-    delivery = await compute_delivery_score(db, vendor_id, start, end)
-    quality = await compute_quality_score(db, vendor_id, start, end)
-    incidents = await compute_incident_score(db, vendor_id, start, end)
 
     scores: dict[str, float] = {}
     if delivery.data_available and delivery.score is not None:
@@ -229,6 +236,18 @@ async def _phase7_overall(
         sum(scores[name] * COMPONENT_WEIGHTS[name] for name in scores) / weight_sum,
         2,
     )
+
+
+async def _phase7_overall(
+    db: AsyncIOMotorDatabase, vendor_id: int, start: date | None, end: date | None
+) -> float | None:
+    """Phase 7 overall performance score (delivery/quality/incident blend)."""
+    delivery, quality, incidents = await asyncio.gather(
+        compute_delivery_score(db, vendor_id, start, end),
+        compute_quality_score(db, vendor_id, start, end),
+        compute_incident_score(db, vendor_id, start, end),
+    )
+    return _phase7_overall_from_subscores(delivery, quality, incidents)
 
 
 def _combine_risks(components: dict[str, ComponentRisk]) -> float | None:
@@ -331,12 +350,9 @@ def _history_days(vendor: Vendor, today: date) -> int:
 async def build_rule_based_risk(db: AsyncIOMotorDatabase, vendor: Vendor) -> RuleBasedResult:
     """Full-history rule-based risk profile for ``vendor``."""
     today = date.today()
-    components, combined = await compute_rule_based_components(db, vendor, None, None)
-
-    delivery = await compute_delivery_score(db, vendor.id, None, None)
-    quality = await compute_quality_score(db, vendor.id, None, None)
-    incidents = await compute_incident_score(db, vendor.id, None, None)
-    total_records = delivery.total_orders + quality.total_evaluations + incidents.total_incidents
+    components, combined, total_records = await compute_rule_based_components(
+        db, vendor, None, None
+    )
     history_days = _history_days(vendor, today)
     if history_days == 0:
         history_days = await _earliest_record_span(db, vendor.id, today)
@@ -367,16 +383,22 @@ async def build_rule_based_risk(db: AsyncIOMotorDatabase, vendor: Vendor) -> Rul
 async def _earliest_record_span(
     db: AsyncIOMotorDatabase, vendor_id: int, today: date
 ) -> int:
+    results = await asyncio.gather(
+        db["purchase_orders"].find_one(
+            {"order_date": {"$ne": None}, "vendor_id": vendor_id},
+            {"order_date": 1, "_id": 0},
+        ),
+        db["quality_evaluations"].find_one(
+            {"evaluation_date": {"$ne": None}, "vendor_id": vendor_id},
+            {"evaluation_date": 1, "_id": 0},
+        ),
+        db["incidents"].find_one(
+            {"reported_date": {"$ne": None}, "vendor_id": vendor_id},
+            {"reported_date": 1, "_id": 0},
+        ),
+    )
     anchors: list[date] = []
-    for collection, field_name in (
-        ("purchase_orders", "order_date"),
-        ("quality_evaluations", "evaluation_date"),
-        ("incidents", "reported_date"),
-    ):
-        row = await db[collection].find_one(
-            {field_name: {"$ne": None}, "vendor_id": vendor_id},
-            {field_name: 1, "_id": 0},
-        )
+    for row, field_name in zip(results, ("order_date", "evaluation_date", "reported_date")):
         if row is None:
             continue
         value = row.get(field_name)
@@ -395,9 +417,11 @@ async def compute_risk_trend(db: AsyncIOMotorDatabase, vendor: Vendor) -> RiskTr
     recent_start = today - window
     previous_start = today - (2 * window)
 
-    _, recent = await compute_rule_based_components(db, vendor, recent_start, today)
-    _, previous = await compute_rule_based_components(
-        db, vendor, previous_start, recent_start - timedelta(days=1)
+    (_, recent, _), (_, previous, _) = await asyncio.gather(
+        compute_rule_based_components(db, vendor, recent_start, today),
+        compute_rule_based_components(
+            db, vendor, previous_start, recent_start - timedelta(days=1)
+        ),
     )
     if recent is None or previous is None:
         return RiskTrend.INSUFFICIENT_DATA

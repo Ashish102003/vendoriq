@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from .core.database import ensure_indexes, get_database
 from .core.config import settings
 from .core.cors import setup_cors
 from .api.v1.router import api_router
@@ -10,8 +11,11 @@ APP_VERSION = "0.2.0"
 
 
 async def _validate_database() -> None:
-    if settings.ENVIRONMENT == "development":
-        await check_connection_async()
+    if settings.ENVIRONMENT != "development":
+        return
+    await check_connection_async()
+    db = await get_database()
+    await ensure_indexes(db)
 
 
 @asynccontextmanager

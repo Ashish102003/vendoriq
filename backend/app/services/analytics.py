@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, timedelta
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -46,7 +47,7 @@ from .vendor_performance import (  # noqa: WPS437 -- intentional same-package re
     _score_delivery_rows,
     _score_incident_rows,
     _score_quality_values,
-    build_performance_list_item,
+    build_performance_list_items,
     build_vendor_performance,
 )
 
@@ -329,7 +330,7 @@ def _build_distribution(
 async def build_distribution(
     db: AsyncIOMotorDatabase, vendors: list[Vendor]
 ) -> PerformanceDistribution:
-    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
+    items = await build_performance_list_items(db, vendors)
     records_set = await _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
     return PerformanceDistribution(
         total_vendors=len(items),
@@ -340,7 +341,7 @@ async def build_distribution(
 async def build_vendor_ranking(
     db: AsyncIOMotorDatabase, vendors: list[Vendor]
 ) -> VendorRanking:
-    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
+    items = await build_performance_list_items(db, vendors)
     records_set = await _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
     scored = [
         item
@@ -799,13 +800,18 @@ async def build_category_performance(
     for vendor in vendors:
         by_category.setdefault(vendor.category_id, []).append(vendor)
 
+    perf_by_vendor = {
+        item.vendor_id: item
+        for item in await build_performance_list_items(db, vendors)
+    }
+
     items: list[CategoryPerformanceItem] = []
     for category in categories:
         category_vendors = by_category.get(category.id, [])
         if not category_vendors:
             continue
         perf_items = [
-            await build_performance_list_item(db, vendor) for vendor in category_vendors
+            perf_by_vendor[vendor.id] for vendor in category_vendors
         ]
         scored = [
             item
@@ -873,10 +879,12 @@ async def build_vendor_comparison(
 ) -> VendorComparison:
     metrics: list[VendorComparisonMetric] = []
     for vendor in vendors:
-        detail = await build_vendor_performance(db, vendor)
-        delivery = await build_delivery_analytics(db, {vendor.id}, start, end)
-        quality = await build_quality_analytics(db, {vendor.id}, start, end)
-        incidents = await build_incident_analytics(db, {vendor.id}, start, end)
+        detail, delivery, quality, incidents = await asyncio.gather(
+            build_vendor_performance(db, vendor),
+            build_delivery_analytics(db, {vendor.id}, start, end),
+            build_quality_analytics(db, {vendor.id}, start, end),
+            build_incident_analytics(db, {vendor.id}, start, end),
+        )
         metrics.append(
             VendorComparisonMetric(
                 vendor_id=vendor.id,
@@ -1143,9 +1151,30 @@ async def build_overview(
     end: date,
 ) -> AnalyticsOverview:
     vendor_ids = {vendor.id for vendor in vendors}
-    total_vendors = await count_docs(db, "vendors", {})
-    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
-    records_set = await _vendor_ids_with_records(db, vendor_ids)
+
+    (
+        total_vendors,
+        items,
+        records_set,
+        unresolved_map,
+        delivery,
+        quality,
+        incidents,
+        delivery_vendor_rows,
+        quality_vendor_rows,
+        incident_rows,
+    ) = await asyncio.gather(
+        count_docs(db, "vendors", {}),
+        build_performance_list_items(db, vendors),
+        _vendor_ids_with_records(db, vendor_ids),
+        _current_unresolved_map(db, vendor_ids),
+        build_delivery_analytics(db, vendor_ids, start, end),
+        build_quality_analytics(db, vendor_ids, start, end),
+        build_incident_analytics(db, vendor_ids, start, end),
+        _delivery_rows_vendor(db, vendor_ids, start, end),
+        _quality_rows_vendor(db, vendor_ids, start, end),
+        _incident_rows(db, vendor_ids, start, end),
+    )
     scored = [
         item
         for item in items
@@ -1157,7 +1186,6 @@ async def build_overview(
         else None
     )
 
-    unresolved_map = await _current_unresolved_map(db, vendor_ids)
     limited_count = 0
     attention = 0
     for item in items:
@@ -1169,26 +1197,19 @@ async def build_overview(
         elif unresolved >= 3 or (item.limited_data and unresolved >= 1):
             attention += 1
 
-    delivery = await build_delivery_analytics(db, vendor_ids, start, end)
-    quality = await build_quality_analytics(db, vendor_ids, start, end)
-    incidents = await build_incident_analytics(db, vendor_ids, start, end)
     distribution = _build_distribution(items, records_set)
 
     delivery_by_vendor: dict[int, list] = {}
-    for vendor_id, order_date, actual, expected in await _delivery_rows_vendor(
-        db, vendor_ids, start, end
-    ):
+    for vendor_id, order_date, actual, expected in delivery_vendor_rows:
         delivery_by_vendor.setdefault(vendor_id, []).append((order_date, actual, expected))
 
     quality_by_vendor: dict[int, list] = {}
-    for vendor_id, evaluation_date, quality_score in await _quality_rows_vendor(
-        db, vendor_ids, start, end
-    ):
+    for vendor_id, evaluation_date, quality_score in quality_vendor_rows:
         quality_by_vendor.setdefault(vendor_id, []).append((evaluation_date, quality_score))
 
     incidents_by_vendor: dict[int, list[Incident]] = {}
     monthly_counts: dict[str, int] = {}
-    for incident in await _incident_rows(db, vendor_ids, start, end):
+    for incident in incident_rows:
         incidents_by_vendor.setdefault(incident.vendor_id, []).append(incident)
         month_key = f"{incident.reported_date.year:04d}-{incident.reported_date.month:02d}"
         monthly_counts[month_key] = monthly_counts.get(month_key, 0) + 1

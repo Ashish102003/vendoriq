@@ -72,7 +72,7 @@ _INDEX_SPECS: list[tuple[str, object, bool, bool]] = [
     (PURCHASE_ORDERS, ("contract_id", ASCENDING), False, False),
     (PURCHASE_ORDERS, ("status", ASCENDING), False, False),
     (PURCHASE_ORDERS, ("order_date", ASCENDING), False, False),
-    (PURCHASE_ORDERS, ("vendor_id", ASCENDING, "order_date", ASCENDING), False, False),
+    (PURCHASE_ORDERS, [("vendor_id", ASCENDING), ("order_date", ASCENDING)], False, False),
     (PURCHASE_ORDERS, ("expected_delivery_date", ASCENDING), False, False),
     (PURCHASE_ORDERS, ("actual_delivery_date", ASCENDING), False, False),
     (QUALITY_EVALUATIONS, ("vendor_id", ASCENDING), False, False),
@@ -80,7 +80,7 @@ _INDEX_SPECS: list[tuple[str, object, bool, bool]] = [
     (QUALITY_EVALUATIONS, ("purchase_order_id", ASCENDING), False, False),
     (QUALITY_EVALUATIONS, ("evaluation_date", ASCENDING), False, False),
     (QUALITY_EVALUATIONS, ("quality_status", ASCENDING), False, False),
-    (QUALITY_EVALUATIONS, ("vendor_id", ASCENDING, "evaluation_date", ASCENDING), False, False),
+    (QUALITY_EVALUATIONS, [("vendor_id", ASCENDING), ("evaluation_date", ASCENDING)], False, False),
     (INCIDENTS, ("incident_number", ASCENDING), True, True),
     (INCIDENTS, ("vendor_id", ASCENDING), False, False),
     (INCIDENTS, ("contract_id", ASCENDING), False, False),
@@ -88,7 +88,7 @@ _INDEX_SPECS: list[tuple[str, object, bool, bool]] = [
     (INCIDENTS, ("status", ASCENDING), False, False),
     (INCIDENTS, ("severity", ASCENDING), False, False),
     (INCIDENTS, ("reported_date", ASCENDING), False, False),
-    (INCIDENTS, ("vendor_id", ASCENDING, "reported_date", ASCENDING), False, False),
+    (INCIDENTS, [("vendor_id", ASCENDING), ("reported_date", ASCENDING)], False, False),
 ]
 
 _client: AsyncIOMotorClient | None = None
@@ -145,6 +145,8 @@ def get_collection(db: AsyncIOMotorDatabase, name: str) -> AsyncIOMotorCollectio
 async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     """Create the indexes that replace the MySQL unique/FK indexes."""
     for collection_name, keys, unique, collation in _INDEX_SPECS:
+        if isinstance(keys, tuple):
+            keys = [list(keys[i : i + 2]) for i in range(0, len(keys), 2)]
         kwargs = {}
         if unique:
             kwargs["unique"] = True

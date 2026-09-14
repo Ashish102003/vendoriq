@@ -24,6 +24,33 @@ const FRIENDLY_ERROR_MESSAGES: Record<number, string> = {
   500: 'An unexpected server error occurred. Please try again.',
 }
 
+const REQUEST_TIMEOUT_MS = 30000
+const TIMEOUT_MESSAGE = 'The request is taking too long. Please try again.'
+
+interface RequestOptions {
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  body?: unknown
+  headers?: HeadersInit
+}
+
+interface InFlightEntry {
+  promise: Promise<unknown>
+}
+
+const inFlight = new Map<string, InFlightEntry>()
+
+function cacheKey(method: string, path: string): string {
+  return `${method} ${path}`
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof DOMException !== 'undefined' &&
+    error instanceof DOMException &&
+    error.name === 'AbortError'
+  )
+}
+
 async function safeErrorBody(response: Response): Promise<unknown> {
   try {
     return await response.json()
@@ -51,41 +78,74 @@ function resolveErrorMessage(body: unknown): string {
   return 'Request failed'
 }
 
-interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
-  body?: unknown
-  headers?: HeadersInit
+async function executeRequest<T>(
+  path: string,
+  options: RequestOptions,
+  method: string,
+): Promise<T> {
+  const { body, headers } = options
+  const token = getAccessToken()
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+
+  try {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...headers,
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        clearAccessToken()
+        window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT))
+      }
+      let message = resolveErrorMessage(await safeErrorBody(response))
+      if (message === 'Request failed') {
+        message =
+          FRIENDLY_ERROR_MESSAGES[response.status as number] ?? message
+      }
+      throw new ApiError(message, response.status)
+    }
+
+    return (await response.json()) as T
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new ApiError(TIMEOUT_MESSAGE)
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timer)
+  }
 }
 
 export async function apiRequest<T>(
   path: string,
   options: RequestOptions = {},
 ): Promise<T> {
-  const { method = 'GET', body, headers } = options
-  const token = getAccessToken()
+  const method = (options.method ?? 'GET').toUpperCase()
+  const key = cacheKey(method, path)
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...headers,
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  })
-
-  if (!response.ok) {
-    if (response.status === 401) {
-      clearAccessToken()
-      window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT))
+  if (method === 'GET') {
+    const existing = inFlight.get(key)
+    if (existing) {
+      return existing.promise as Promise<T>
     }
-    let message = resolveErrorMessage(await safeErrorBody(response))
-    if (message === 'Request failed') {
-      message =
-        FRIENDLY_ERROR_MESSAGES[response.status as number] ?? message
-    }
-    throw new ApiError(message, response.status)
+    const promise = executeRequest<T>(path, options, method)
+    const entry: InFlightEntry = { promise }
+    inFlight.set(key, entry)
+    promise.finally(() => {
+      if (inFlight.get(key) === entry) {
+        inFlight.delete(key)
+      }
+    }).catch(() => {})
+    return promise
   }
 
-  return (await response.json()) as T
+  return executeRequest<T>(path, options, method)
 }

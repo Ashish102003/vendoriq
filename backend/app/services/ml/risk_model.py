@@ -52,6 +52,9 @@ def _read_metadata() -> dict | None:
         return json.load(handle)
 
 
+_model_cache: tuple[Path, int, int, tuple[object, dict]] | None = None
+
+
 async def train_model(db: AsyncIOMotorDatabase) -> TrainingResult:
     """Train (or retrain) the predictive risk model from real records.
 
@@ -107,6 +110,7 @@ async def train_model(db: AsyncIOMotorDatabase) -> TrainingResult:
     dump(model, _model_path())
     with _metadata_path().open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
+    _invalidated_load_cache()
 
     return TrainingResult(
         trained=True,
@@ -120,12 +124,42 @@ async def train_model(db: AsyncIOMotorDatabase) -> TrainingResult:
     )
 
 
+def _invalidated_load_cache() -> None:
+    """Drop the in-memory model cache (after train or artifact changes)."""
+    global _model_cache
+    _model_cache = None
+
+
 def load_model() -> tuple[object, dict] | None:
-    """Return ``(model, metadata)`` or ``None`` when no model is available."""
+    """Return ``(model, metadata)`` or ``None`` when no model is available.
+
+    The model artifact is loaded once and cached in memory; the cache is
+    keyed by artifact file mtimes so retrains, artifact removals, and test
+    directory redirection are always honored.
+    """
+    global _model_cache
     if not is_model_available():
+        _model_cache = None
         return None
+    model_path = _model_path()
+    metadata_path = _metadata_path()
+    try:
+        model_stamp = model_path.stat().st_mtime_ns
+        metadata_stamp = metadata_path.stat().st_mtime_ns
+    except OSError:
+        _model_cache = None
+        return None
+    if (
+        _model_cache is not None
+        and _model_cache[0] == model_path
+        and _model_cache[1] == model_stamp
+        and _model_cache[2] == metadata_stamp
+    ):
+        return _model_cache[3]
     metadata = _read_metadata() or {}
-    return load(_model_path()), metadata
+    loaded: tuple[object, dict] = (load(model_path), metadata)
+    _model_cache = (model_path, model_stamp, metadata_stamp, loaded)
+    return loaded
 
 
 def get_model_info() -> ModelInfo:
@@ -178,6 +212,7 @@ async def predict_ml(db: AsyncIOMotorDatabase, vendor_id: int) -> float | None:
 
 def clear_artifacts() -> None:
     """Remove local model artifacts (used by tests to restore a clean state)."""
+    _invalidated_load_cache()
     for path in (_model_path(), _metadata_path()):
         if path.exists():
             path.unlink()
