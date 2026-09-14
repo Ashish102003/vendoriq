@@ -2,7 +2,7 @@
 
 Purpose
 -------
-Populate a local development database with a realistic, internally consistent
+Populate a development database with a realistic, internally consistent
 demo dataset so the full VendorIQ flow can be demonstrated end-to-end:
 
     Login → Vendors → Contracts → Purchase Orders → Deliveries →
@@ -29,15 +29,17 @@ Safety
       python -m app.scripts.seed_demo_data --clean
 """
 
+import asyncio
 import sys
 from datetime import date, timedelta
 from decimal import Decimal
 
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from ..core.config import settings
-from ..core.database import SessionLocal
+from ..core.database import get_database
 from ..core.security import hash_password
+from ..db.repository import find_doc, insert_doc
 from ..models import (
     Contract,
     Incident,
@@ -444,46 +446,45 @@ _VENDORS = [
 # ---------------------------------------------------------------------------
 
 
-def _category(db: Session, name: str) -> VendorCategory:
-    category = db.query(VendorCategory).filter(VendorCategory.name == name).first()
+async def _category(db: AsyncIOMotorDatabase, name: str) -> VendorCategory:
+    category = await find_doc(db, "vendor_categories", VendorCategory, {"name": name})
     if category is None:
         category = VendorCategory(
             name=name,
             description=f"Demo category: {name}",
             is_active=True,
         )
-        db.add(category)
-        db.flush()
+        await insert_doc(db, "vendor_categories", category)
     return category
 
 
-def _admin_user(db: Session) -> User | None:
-    return (
-        db.query(User)
-        .join(Role)
-        .filter(Role.name == "Admin")
-        .order_by(User.id.asc())
-        .first()
-    )
+async def _admin_user(db: AsyncIOMotorDatabase):
+    admin_role = await find_doc(db, "roles", Role, {"name": "Admin"})
+    if admin_role is None:
+        return None
+    users = await db["users"].find({"role_id": admin_role.id}).sort("id", 1).limit(1).to_list(None)
+    if not users:
+        return None
+    from ..models import User
+
+    return User.from_doc(users[0])
 
 
-def seed_demo_data(db=None) -> int:
+async def seed_demo_data(db: AsyncIOMotorDatabase | None = None) -> int:
     """Create the demo dataset. Returns the number of vendors created."""
     if settings.ENVIRONMENT.lower() == "production":
         raise RuntimeError(
             "Refusing to run in production. seed_demo_data is development-only."
         )
-    if SessionLocal is None:
-        raise RuntimeError("Database not configured. Please set DATABASE_URL.")
 
     owns_session = db is None
     if owns_session:
-        db = SessionLocal()
+        db = await get_database()
 
     created_vendors = 0
     try:
-        seed_roles(db)
-        admin = _admin_user(db)
+        await seed_roles(db)
+        admin = await _admin_user(db)
         if admin is None:
             raise RuntimeError("No Admin user exists. Run create_initial_admin first.")
 
@@ -491,11 +492,11 @@ def seed_demo_data(db=None) -> int:
         user_cache: dict[str, User] = {}
         for username, role_name in DEMO_USER_ROLES.items():
             email = f"{username}@{DEMO_USER_DOMAIN}"
-            existing = db.query(User).filter(User.email == email).first()
+            existing = await find_doc(db, "users", User, {"email": email})
             if existing is not None:
                 user_cache[username] = existing
                 continue
-            role = db.query(Role).filter(Role.name == role_name).first()
+            role = await find_doc(db, "roles", Role, {"name": role_name})
             user = User(
                 first_name="Demo",
                 last_name=role_name,
@@ -504,8 +505,7 @@ def seed_demo_data(db=None) -> int:
                 role_id=role.id if role else admin.role_id,
                 is_active=True,
             )
-            db.add(user)
-            db.flush()
+            await insert_doc(db, "users", user)
             user_cache[username] = user
 
         vm_user = user_cache.get("demo.vendor-manager", admin)
@@ -515,14 +515,14 @@ def seed_demo_data(db=None) -> int:
         incidents: list[Incident] = []
 
         for spec in _VENDORS:
-            existing_vendor = (
-                db.query(Vendor).filter(Vendor.vendor_code == spec["vendor_code"]).first()
+            existing_vendor = await find_doc(
+                db, "vendors", Vendor, {"vendor_code": spec["vendor_code"]}
             )
             if existing_vendor is not None:
                 print(f"  SKIP   {spec['vendor_code']} {spec['company_name']} (already exists)")
                 continue
 
-            category = _category(db, spec["category"])
+            category = await _category(db, spec["category"])
             vendor = Vendor(
                 vendor_code=spec["vendor_code"],
                 company_name=spec["company_name"],
@@ -540,8 +540,7 @@ def seed_demo_data(db=None) -> int:
                 vendor_since=spec["vendor_since"],
                 is_active=spec["is_active"],
             )
-            db.add(vendor)
-            db.flush()
+            await insert_doc(db, "vendors", vendor)
             created_vendors += 1
 
             for c in spec["contracts"]:
@@ -556,8 +555,7 @@ def seed_demo_data(db=None) -> int:
                     status=c["status"],
                     is_active=True,
                 )
-                db.add(contract)
-                db.flush()
+                await insert_doc(db, "contracts", contract)
                 contracts.append(contract)
 
             for o in spec.get("orders", []):
@@ -573,8 +571,7 @@ def seed_demo_data(db=None) -> int:
                     actual_delivery_date=o["actual"],
                     status=o["status"],
                 )
-                db.add(order)
-                db.flush()
+                await insert_doc(db, "purchase_orders", order)
                 orders.append(order)
 
             for (eval_date, score) in spec["evaluations"]:
@@ -590,7 +587,7 @@ def seed_demo_data(db=None) -> int:
                     comments=f"Demo quality evaluation: {score}/100.",
                     created_by=vm_user.id,
                 )
-                db.add(evaluation)
+                await insert_doc(db, "quality_evaluations", evaluation)
 
             for inc in spec["incidents"]:
                 incident = Incident(
@@ -614,8 +611,7 @@ def seed_demo_data(db=None) -> int:
                         else None
                     ),
                 )
-                db.add(incident)
-                db.flush()
+                await insert_doc(db, "incidents", incident)
                 incidents.append(incident)
 
             print(
@@ -624,7 +620,6 @@ def seed_demo_data(db=None) -> int:
                 f"{len(spec['evaluations'])} evaluations, {len(spec['incidents'])} incidents)"
             )
 
-        db.commit()
         print(f"Demo data seeding complete: {created_vendors} vendors created.")
         if created_vendors:
             print(f"Demo user password (development only): {DEMO_PASSWORD}")
@@ -632,65 +627,53 @@ def seed_demo_data(db=None) -> int:
         return created_vendors
     finally:
         if owns_session:
-            db.close()
+            db.client.close()
 
 
-def clean_demo_data(db=None) -> int:
+async def clean_demo_data(db: AsyncIOMotorDatabase | None = None) -> int:
     """Remove demo records (identified by DEMO- codes). Never touches real data."""
-    if SessionLocal is None:
-        raise RuntimeError("Database not configured. Please set DATABASE_URL.")
-
     owns_session = db is None
     if owns_session:
-        db = SessionLocal()
+        db = await get_database()
     try:
         deleted = 0
-        incidents = db.query(Incident).filter(Incident.incident_number.like("DEMO-%")).all()
-        for i in incidents:
-            db.delete(i)
-            deleted += 1
-        evals = db.query(QualityEvaluation).filter(
-            QualityEvaluation.comments.like("Demo quality evaluation%")
-        ).all()
-        for e in evals:
-            db.delete(e)
-            deleted += 1
-        orders = db.query(PurchaseOrder).filter(PurchaseOrder.order_number.like("DEMO-PO-%")).all()
-        for o in orders:
-            db.delete(o)
-            deleted += 1
-        contracts = db.query(Contract).filter(Contract.contract_number.like("DEMO-C%")).all()
-        for c in contracts:
-            db.delete(c)
-            deleted += 1
-        vendors = db.query(Vendor).filter(Vendor.vendor_code.like("DEMO-%")).all()
-        for v in vendors:
-            db.delete(v)
-            deleted += 1
-        for username in DEMO_USER_ROLES:
-            user = db.query(User).filter(User.email == f"{username}@{DEMO_USER_DOMAIN}").first()
-            if user is not None:
-                db.delete(user)
-                deleted += 1
-        db.commit()
+
+        async def _delete(collection: str, criteria: dict) -> None:
+            nonlocal deleted
+            result = await db[collection].delete_many(criteria)
+            deleted += result.deleted_count
+
+        async def _clean_all() -> None:
+            await _delete("incidents", {"incident_number": {"$regex": "^DEMO-"}})
+            await _delete(
+                "quality_evaluations",
+                {"comments": {"$regex": "^Demo quality evaluation"}},
+            )
+            await _delete("purchase_orders", {"order_number": {"$regex": "^DEMO-PO-"}})
+            await _delete("contracts", {"contract_number": {"$regex": "^DEMO-C"}})
+            await _delete("vendors", {"vendor_code": {"$regex": "^DEMO-"}})
+            for username in DEMO_USER_ROLES:
+                await _delete("users", {"email": f"{username}@{DEMO_USER_DOMAIN}"})
+
+        await _clean_all()
         print(f"Demo data cleaned: {deleted} records removed.")
         return deleted
     finally:
         if owns_session:
-            db.close()
+            db.client.close()
 
 
 def main() -> None:
     if "--clean" in sys.argv:
         try:
-            clean_demo_data()
+            asyncio.run(clean_demo_data())
         except Exception as exc:
             print(f"Demo data clean-up FAILED: {exc}")
             sys.exit(1)
         return
 
     try:
-        seed_demo_data()
+        asyncio.run(seed_demo_data())
     except Exception as exc:
         print(f"Demo data seeding FAILED: {exc}")
         sys.exit(1)

@@ -1,23 +1,24 @@
-from typing import TYPE_CHECKING, Optional
-from sqlalchemy import Boolean, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from .base import Base, TimestampMixin
+from datetime import datetime
+from typing import ClassVar, Optional
 
-if TYPE_CHECKING:
-    from .vendor import Vendor
+from .base import DocumentModel
 
 
-class VendorCategory(Base, TimestampMixin):
-    __tablename__ = "vendor_categories"
+class VendorCategory(DocumentModel):
+    """Backs the former ``vendor_categories`` table."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-        server_default="1",
+    SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "name",
+        "description",
+        "is_active",
+        "created_at",
+        "updated_at",
     )
 
-    vendors: Mapped[list["Vendor"]] = relationship(back_populates="category")
+    id: Optional[int] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None

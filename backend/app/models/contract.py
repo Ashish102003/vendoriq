@@ -1,55 +1,43 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING
-from sqlalchemy import Boolean, CheckConstraint, Date, Enum, ForeignKey, Numeric, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from .base import Base, TimestampMixin
+from typing import ClassVar, Optional
+
+from .base import DocumentModel
 from .enums import ContractStatus
-
-if TYPE_CHECKING:
-    from .incident import Incident
-    from .purchase_order import PurchaseOrder
-    from .quality_evaluation import QualityEvaluation
-    from .vendor import Vendor
+from .vendor import Vendor
 
 
-class Contract(Base, TimestampMixin):
-    __tablename__ = "contracts"
-    __table_args__ = (
-        CheckConstraint("contract_value >= 0", name="ck_contracts_contract_value_non_negative"),
-        CheckConstraint("end_date >= start_date", name="ck_contracts_end_date_after_start_date"),
-    )
+class Contract(DocumentModel):
+    """Backs the former ``contracts`` table."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    vendor_id: Mapped[int] = mapped_column(
-        ForeignKey("vendors.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
+    SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "vendor_id",
+        "contract_number",
+        "title",
+        "description",
+        "contract_value",
+        "start_date",
+        "end_date",
+        "status",
+        "is_active",
+        "created_at",
+        "updated_at",
     )
-    contract_number: Mapped[str] = mapped_column(String(30), unique=True, nullable=False)
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    contract_value: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    start_date: Mapped[date] = mapped_column(Date, nullable=False)
-    end_date: Mapped[date] = mapped_column(Date, nullable=False)
-    status: Mapped[ContractStatus] = mapped_column(
-        Enum(ContractStatus, native_enum=False, length=32),
-        nullable=False,
-        default=ContractStatus.DRAFT,
-        server_default=ContractStatus.DRAFT.value,
-    )
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-        server_default="1",
-    )
+    ENUM_FIELDS: ClassVar[dict[str, type]] = {"status": ContractStatus}
+    DATE_FIELDS: ClassVar[set[str]] = {"start_date", "end_date"}
 
-    vendor: Mapped["Vendor"] = relationship(back_populates="contracts")
-    purchase_orders: Mapped[list["PurchaseOrder"]] = relationship(
-        back_populates="contract"
-    )
-    quality_evaluations: Mapped[list["QualityEvaluation"]] = relationship(
-        back_populates="contract"
-    )
-    incidents: Mapped[list["Incident"]] = relationship(back_populates="contract")
+    id: Optional[int] = None
+    vendor_id: Optional[int] = None
+    contract_number: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    contract_value: Optional[Decimal] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Optional[ContractStatus] = ContractStatus.DRAFT
+    is_active: Optional[bool] = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    vendor: Optional[Vendor] = None

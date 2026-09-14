@@ -4,14 +4,14 @@ from fastapi.responses import JSONResponse
 from .core.config import settings
 from .core.cors import setup_cors
 from .api.v1.router import api_router
-from .db.check_db import check_connection
+from .db.check_db import check_connection_async
 
 APP_VERSION = "0.2.0"
 
 
 async def _validate_database() -> None:
     if settings.ENVIRONMENT == "development":
-        check_connection()
+        await check_connection_async()
 
 
 @asynccontextmanager

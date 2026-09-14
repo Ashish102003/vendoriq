@@ -1,12 +1,13 @@
-from typing import Callable
+from typing import Awaitable, Callable
 
 import jwt as pyjwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from ..core.database import get_db
 from ..core.jwt import decode_access_token
+from ..db.repository import attach_roles, find_doc
 from ..models import User
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -18,9 +19,9 @@ CREDENTIALS_EXCEPTION = HTTPException(
 )
 
 
-def get_current_user(
+async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> User:
     """Validate the Bearer token and return the authenticated user."""
     if credentials is None:
@@ -35,7 +36,7 @@ def get_current_user(
     if user_id is None:
         raise CREDENTIALS_EXCEPTION
 
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    user = await find_doc(db, "users", User, {"id": int(user_id)})
     if user is None:
         raise CREDENTIALS_EXCEPTION
     if not user.is_active:
@@ -43,13 +44,16 @@ def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Inactive user",
         )
+    await attach_roles(db, [user])
     return user
 
 
 def require_roles(*allowed_roles: str) -> Callable:
     """Return a dependency that only allows users with one of the given roles."""
 
-    def role_checker(current_user: User = Depends(get_current_user)) -> User:
+    async def role_checker(
+        current_user: User = Depends(get_current_user),
+    ) -> User:
         if current_user.role is None or current_user.role.name not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

@@ -1,43 +1,33 @@
-from typing import TYPE_CHECKING
-from sqlalchemy import Boolean, ForeignKey, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from .base import Base, TimestampMixin
+from datetime import datetime
+from typing import ClassVar, Optional
 
-if TYPE_CHECKING:
-    from .incident import Incident
-    from .quality_evaluation import QualityEvaluation
-    from .role import Role
+from .base import DocumentModel
+from .role import Role
 
 
-class User(Base, TimestampMixin):
-    __tablename__ = "users"
+class User(DocumentModel):
+    """Backs the former ``users`` table."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    first_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    last_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role_id: Mapped[int] = mapped_column(
-        ForeignKey("roles.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-        server_default="1",
+    SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "first_name",
+        "last_name",
+        "email",
+        "password_hash",
+        "role_id",
+        "is_active",
+        "created_at",
+        "updated_at",
     )
 
-    role: Mapped["Role"] = relationship(back_populates="users")
-    quality_evaluations_created: Mapped[list["QualityEvaluation"]] = relationship(
-        back_populates="created_by_user"
-    )
-    incidents_reported: Mapped[list["Incident"]] = relationship(
-        foreign_keys="Incident.reported_by",
-        back_populates="reported_by_user",
-    )
-    incidents_assigned: Mapped[list["Incident"]] = relationship(
-        foreign_keys="Incident.assigned_to",
-        back_populates="assigned_to_user",
-    )
+    id: Optional[int] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    password_hash: Optional[str] = None
+    role_id: Optional[int] = None
+    is_active: Optional[bool] = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    role: Optional["Role"] = None

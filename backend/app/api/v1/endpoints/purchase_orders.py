@@ -3,11 +3,20 @@ from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 
 from ....core.database import get_db
+from ....db.repository import (
+    attach_order_relations,
+    cis,
+    contains,
+    count_docs,
+    find_doc,
+    find_docs,
+    insert_doc,
+    update_doc,
+)
 from ....dependencies.auth import get_current_user, require_roles
 from ....models import Contract, PurchaseOrder, User, Vendor
 from ....models.enums import PurchaseOrderStatus
@@ -25,65 +34,61 @@ router = APIRouter()
 
 PO_EDITOR_ROLES = ("Admin", "Vendor Manager", "Procurement Manager")
 
-SORT_FIELDS: dict[str, object] = {
-    "order_number": PurchaseOrder.order_number,
-    "title": PurchaseOrder.title,
-    "order_value": PurchaseOrder.order_value,
-    "order_date": PurchaseOrder.order_date,
-    "expected_delivery_date": PurchaseOrder.expected_delivery_date,
-    "actual_delivery_date": PurchaseOrder.actual_delivery_date,
-    "status": PurchaseOrder.status,
-    "created_at": PurchaseOrder.created_at,
-    "updated_at": PurchaseOrder.updated_at,
+SORT_FIELDS: dict[str, str] = {
+    "order_number": "order_number",
+    "title": "title",
+    "order_value": "order_value",
+    "order_date": "order_date",
+    "expected_delivery_date": "expected_delivery_date",
+    "actual_delivery_date": "actual_delivery_date",
+    "status": "status",
+    "created_at": "created_at",
+    "updated_at": "updated_at",
 }
 SORT_ORDER = Literal["asc", "desc"]
 
 
-def _get_purchase_order_or_404(db: Session, purchase_order_id: int) -> PurchaseOrder:
-    po = (
-        db.query(PurchaseOrder)
-        .options(joinedload(PurchaseOrder.vendor), joinedload(PurchaseOrder.contract))
-        .filter(PurchaseOrder.id == purchase_order_id)
-        .first()
-    )
+async def _get_purchase_order_or_404(
+    db: AsyncIOMotorDatabase, purchase_order_id: int
+) -> PurchaseOrder:
+    po = await find_doc(db, "purchase_orders", PurchaseOrder, {"id": purchase_order_id})
     if po is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Purchase order not found",
         )
+    await attach_order_relations(db, [po])
     return po
 
 
-def _order_number_exists(
-    db: Session, order_number: str, exclude_id: int | None = None
+async def _order_number_exists(
+    db: AsyncIOMotorDatabase, order_number: str, exclude_id: int | None = None
 ) -> bool:
-    query = db.query(PurchaseOrder).filter(
-        func.lower(PurchaseOrder.order_number) == order_number.lower()
-    )
+    criteria: dict = {"order_number": cis(order_number)}
     if exclude_id is not None:
-        query = query.filter(PurchaseOrder.id != exclude_id)
-    return query.first() is not None
+        criteria["id"] = {"$ne": exclude_id}
+    return await find_doc(db, "purchase_orders", PurchaseOrder, criteria) is not None
 
 
 def _validate_order_dates(order_date, expected_delivery_date, actual_delivery_date=None):
-    if expected_delivery_date < order_date:
+    if order_date and expected_delivery_date and expected_delivery_date < order_date:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="expected_delivery_date must be on or after order_date",
         )
-    if actual_delivery_date is not None and actual_delivery_date < order_date:
+    if actual_delivery_date is not None and order_date and actual_delivery_date < order_date:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="actual_delivery_date must be on or after order_date",
         )
 
 
-def _validate_contract_vendor(
-    db: Session, vendor_id: int, contract_id: int | None
+async def _validate_contract_vendor(
+    db: AsyncIOMotorDatabase, vendor_id: int, contract_id: int | None
 ) -> None:
     if contract_id is None:
         return
-    contract = db.get(Contract, contract_id)
+    contract = await find_doc(db, "contracts", Contract, {"id": contract_id})
     if contract is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -97,45 +102,45 @@ def _validate_contract_vendor(
 
 
 @router.get("/statistics", response_model=PurchaseOrderStatistics)
-def get_purchase_order_statistics(
-    db: Session = Depends(get_db),
+async def get_purchase_order_statistics(
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    total = db.query(func.count(PurchaseOrder.id)).scalar() or 0
-    status_counts = {
-        row_status: count
-        for row_status, count in db.query(
-            PurchaseOrder.status, func.count(PurchaseOrder.id)
-        )
-        .group_by(PurchaseOrder.status)
-        .all()
-    }
-    total_value = db.query(func.sum(PurchaseOrder.order_value)).scalar()
+    total = await count_docs(db, "purchase_orders", {})
+    status_rows = await db["purchase_orders"].aggregate(
+        [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+    ).to_list(None)
+    status_counts = {row["_id"]: row["count"] for row in status_rows}
+    value_rows = await db["purchase_orders"].aggregate(
+        [{"$group": {"_id": None, "total": {"$sum": "$order_value"}}}]
+    ).to_list(None)
+    total_value = value_rows[0]["total"] if value_rows else Decimal("0")
+    if hasattr(total_value, "to_decimal"):
+        total_value = total_value.to_decimal()
 
-    rows_with_delivery = (
-        db.query(
-            PurchaseOrder.actual_delivery_date,
-            PurchaseOrder.expected_delivery_date,
-        )
-        .filter(PurchaseOrder.actual_delivery_date.isnot(None))
-        .all()
+    delivery_rows = await find_docs(
+        db,
+        "purchase_orders",
+        None,
+        {"actual_delivery_date": {"$ne": None}},
+        project={"actual_delivery_date": 1, "expected_delivery_date": 1},
     )
-    on_time = sum(1 for act, exp in rows_with_delivery if act <= exp)
-    delayed = sum(1 for act, exp in rows_with_delivery if act > exp)
-    pending = total - len(rows_with_delivery)
+    on_time = sum(1 for row in delivery_rows if row["actual_delivery_date"] <= row["expected_delivery_date"])
+    delayed = len(delivery_rows) - on_time
+    pending = total - len(delivery_rows)
 
     return PurchaseOrderStatistics(
         total_orders=total,
-        draft_orders=status_counts.get(PurchaseOrderStatus.DRAFT, 0),
-        issued_orders=status_counts.get(PurchaseOrderStatus.ISSUED, 0),
-        in_progress_orders=status_counts.get(PurchaseOrderStatus.IN_PROGRESS, 0),
-        delivered_orders=status_counts.get(PurchaseOrderStatus.DELIVERED, 0),
+        draft_orders=status_counts.get(PurchaseOrderStatus.DRAFT.value, 0),
+        issued_orders=status_counts.get(PurchaseOrderStatus.ISSUED.value, 0),
+        in_progress_orders=status_counts.get(PurchaseOrderStatus.IN_PROGRESS.value, 0),
+        delivered_orders=status_counts.get(PurchaseOrderStatus.DELIVERED.value, 0),
         partially_delivered_orders=status_counts.get(
-            PurchaseOrderStatus.PARTIALLY_DELIVERED, 0
+            PurchaseOrderStatus.PARTIALLY_DELIVERED.value, 0
         ),
-        cancelled_orders=status_counts.get(PurchaseOrderStatus.CANCELLED, 0),
-        closed_orders=status_counts.get(PurchaseOrderStatus.CLOSED, 0),
-        total_order_value=total_value or Decimal("0"),
+        cancelled_orders=status_counts.get(PurchaseOrderStatus.CANCELLED.value, 0),
+        closed_orders=status_counts.get(PurchaseOrderStatus.CLOSED.value, 0),
+        total_order_value=total_value,
         on_time_deliveries=on_time,
         delayed_deliveries=delayed,
         pending_deliveries=pending,
@@ -143,7 +148,7 @@ def get_purchase_order_statistics(
 
 
 @router.get("", response_model=PaginatedPurchaseOrders)
-def list_purchase_orders(
+async def list_purchase_orders(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
     search: str | None = Query(default=None, max_length=100),
@@ -162,51 +167,42 @@ def list_purchase_orders(
         "updated_at",
     ] = "created_at",
     sort_order: SORT_ORDER = "desc",
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    conditions = []
+    criteria: dict = {}
     if search:
         term = search.strip()
         if term:
-            like = f"%{term}%"
-            conditions.append(
-                or_(
-                    PurchaseOrder.order_number.ilike(like),
-                    PurchaseOrder.title.ilike(like),
-                )
-            )
+            pattern = contains(term)
+            criteria["$or"] = [
+                {"order_number": pattern},
+                {"title": pattern},
+            ]
     if vendor_id is not None:
-        conditions.append(PurchaseOrder.vendor_id == vendor_id)
+        criteria["vendor_id"] = vendor_id
     if contract_id is not None:
-        conditions.append(PurchaseOrder.contract_id == contract_id)
+        criteria["contract_id"] = contract_id
     if status_filter is not None:
-        conditions.append(PurchaseOrder.status == status_filter)
+        criteria["status"] = status_filter.value
 
-    base = db.query(PurchaseOrder)
-    if conditions:
-        base = base.filter(*conditions)
-    total = base.count() or 0
+    total = await count_docs(db, "purchase_orders", criteria)
 
-    items_query = db.query(PurchaseOrder).options(
-        joinedload(PurchaseOrder.vendor), joinedload(PurchaseOrder.contract)
+    sort = [(SORT_FIELDS[sort_by], 1 if sort_order == "asc" else -1)]
+    orders = await find_docs(
+        db,
+        "purchase_orders",
+        PurchaseOrder,
+        criteria,
+        sort=sort,
+        skip=(page - 1) * page_size,
+        limit=page_size,
     )
-    if conditions:
-        items_query = items_query.filter(*conditions)
-
-    order_column: object = SORT_FIELDS[sort_by]
-    if sort_order == "desc":
-        order_column = order_column.desc()
-    items = (
-        items_query.order_by(order_column)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
+    await attach_order_relations(db, orders)
 
     total_pages = math.ceil(total / page_size) if total else 0
     return {
-        "items": items,
+        "items": orders,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -219,23 +215,23 @@ def list_purchase_orders(
     response_model=PurchaseOrderDetailResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_purchase_order(
+async def create_purchase_order(
     payload: PurchaseOrderCreate,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*PO_EDITOR_ROLES)),
 ):
-    vendor = db.get(Vendor, payload.vendor_id)
+    vendor = await find_doc(db, "vendors", Vendor, {"id": payload.vendor_id})
     if vendor is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Vendor not found",
         )
 
-    _validate_contract_vendor(db, payload.vendor_id, payload.contract_id)
+    await _validate_contract_vendor(db, payload.vendor_id, payload.contract_id)
     _validate_order_dates(payload.order_date, payload.expected_delivery_date)
 
     order_number = payload.order_number.strip().upper()
-    if _order_number_exists(db, order_number):
+    if await _order_number_exists(db, order_number):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order number already exists",
@@ -253,42 +249,33 @@ def create_purchase_order(
         status=payload.status,
     )
     try:
-        db.add(po)
-        db.commit()
-        db.refresh(po)
-    except IntegrityError:
-        db.rollback()
+        await insert_doc(db, "purchase_orders", po)
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order number already exists",
         )
-    return (
-        db.query(PurchaseOrder)
-        .options(
-            joinedload(PurchaseOrder.vendor), joinedload(PurchaseOrder.contract)
-        )
-        .filter(PurchaseOrder.id == po.id)
-        .first()
-    )
+    await attach_order_relations(db, [po])
+    return po
 
 
 @router.get("/{purchase_order_id}", response_model=PurchaseOrderDetailResponse)
-def get_purchase_order(
+async def get_purchase_order(
     purchase_order_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return _get_purchase_order_or_404(db, purchase_order_id)
+    return await _get_purchase_order_or_404(db, purchase_order_id)
 
 
 @router.patch("/{purchase_order_id}", response_model=PurchaseOrderDetailResponse)
-def update_purchase_order(
+async def update_purchase_order(
     purchase_order_id: int,
     payload: PurchaseOrderUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*PO_EDITOR_ROLES)),
 ):
-    po = _get_purchase_order_or_404(db, purchase_order_id)
+    await _get_purchase_order_or_404(db, purchase_order_id)
     data = payload.model_dump(exclude_unset=True)
 
     if "vendor_id" in data:
@@ -297,13 +284,12 @@ def update_purchase_order(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Vendor is required",
             )
-        vendor = db.get(Vendor, data["vendor_id"])
+        vendor = await find_doc(db, "vendors", Vendor, {"id": data["vendor_id"]})
         if vendor is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Vendor not found",
             )
-        po.vendor_id = data["vendor_id"]
 
     if "order_number" in data:
         new_number = (data["order_number"] or "").strip().upper()
@@ -312,17 +298,12 @@ def update_purchase_order(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Order number is required",
             )
-        if _order_number_exists(db, new_number, exclude_id=po.id):
+        if await _order_number_exists(db, new_number, exclude_id=purchase_order_id):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Order number already exists",
             )
-        po.order_number = new_number
-
-    if "contract_id" in data:
-        po.contract_id = data["contract_id"]
-
-    _validate_contract_vendor(db, po.vendor_id, po.contract_id)
+        data["order_number"] = new_number
 
     if "title" in data:
         title = (data["title"] or "").strip()
@@ -331,7 +312,7 @@ def update_purchase_order(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Title is required",
             )
-        po.title = title
+        data["title"] = title
 
     if "order_value" in data:
         if data["order_value"] is None:
@@ -339,100 +320,101 @@ def update_purchase_order(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Order value is required",
             )
-        po.order_value = data["order_value"]
 
-    for field in ("order_date", "expected_delivery_date", "actual_delivery_date"):
-        if field in data:
-            setattr(po, field, data[field])
+    vendor_id = data.get("vendor_id", None)
+    if vendor_id is None:
+        existing = await find_doc(db, "purchase_orders", PurchaseOrder, {"id": purchase_order_id})
+        vendor_id = existing.vendor_id
+    contract_id = data.get("contract_id", None)
+    if contract_id is None and "contract_id" not in data:
+        existing = await find_doc(db, "purchase_orders", PurchaseOrder, {"id": purchase_order_id})
+        contract_id = existing.contract_id
+    await _validate_contract_vendor(db, vendor_id, contract_id)
 
-    _validate_order_dates(
-        po.order_date, po.expected_delivery_date, po.actual_delivery_date
-    )
+    order_date = data.get("order_date", None)
+    expected_delivery_date = data.get("expected_delivery_date", None)
+    actual_delivery_date = data.get("actual_delivery_date", None)
+    if order_date is None or expected_delivery_date is None:
+        existing = await find_doc(db, "purchase_orders", PurchaseOrder, {"id": purchase_order_id})
+        order_date = order_date or existing.order_date
+        expected_delivery_date = expected_delivery_date or existing.expected_delivery_date
+        if actual_delivery_date is None:
+            actual_delivery_date = existing.actual_delivery_date
+    _validate_order_dates(order_date, expected_delivery_date, actual_delivery_date)
 
-    for field in ("description", "status"):
-        if field in data:
-            setattr(po, field, data[field])
+    update_fields = {
+        "vendor_id",
+        "order_number",
+        "contract_id",
+        "title",
+        "description",
+        "order_value",
+        "order_date",
+        "expected_delivery_date",
+        "actual_delivery_date",
+        "status",
+    }
+    values = {field: data[field] for field in update_fields & set(data)}
 
     try:
-        db.commit()
-        db.refresh(po)
-    except IntegrityError:
-        db.rollback()
+        await update_doc(db, "purchase_orders", {"id": purchase_order_id}, values)
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order number already exists",
         )
-    return (
-        db.query(PurchaseOrder)
-        .options(
-            joinedload(PurchaseOrder.vendor), joinedload(PurchaseOrder.contract)
-        )
-        .filter(PurchaseOrder.id == po.id)
-        .first()
-    )
+    return await _get_purchase_order_or_404(db, purchase_order_id)
 
 
 @router.patch(
     "/{purchase_order_id}/status", response_model=PurchaseOrderDetailResponse
 )
-def update_purchase_order_status(
+async def update_purchase_order_status(
     purchase_order_id: int,
     payload: PurchaseOrderStatusUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*PO_EDITOR_ROLES)),
 ):
-    po = _get_purchase_order_or_404(db, purchase_order_id)
-    po.status = payload.status
+    await _get_purchase_order_or_404(db, purchase_order_id)
     try:
-        db.commit()
-        db.refresh(po)
-    except IntegrityError:
-        db.rollback()
+        await update_doc(
+            db,
+            "purchase_orders",
+            {"id": purchase_order_id},
+            {"status": payload.status.value},
+        )
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order number already exists",
         )
-    return (
-        db.query(PurchaseOrder)
-        .options(
-            joinedload(PurchaseOrder.vendor), joinedload(PurchaseOrder.contract)
-        )
-        .filter(PurchaseOrder.id == po.id)
-        .first()
-    )
+    return await _get_purchase_order_or_404(db, purchase_order_id)
 
 
 @router.patch(
     "/{purchase_order_id}/delivery", response_model=PurchaseOrderDetailResponse
 )
-def record_delivery(
+async def record_delivery(
     purchase_order_id: int,
     payload: DeliveryRecord,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*PO_EDITOR_ROLES)),
 ):
-    po = _get_purchase_order_or_404(db, purchase_order_id)
-    po.actual_delivery_date = payload.actual_delivery_date
-
+    po = await _get_purchase_order_or_404(db, purchase_order_id)
+    values: dict = {"actual_delivery_date": payload.actual_delivery_date}
     if payload.status is not None:
-        po.status = payload.status
+        values["status"] = payload.status.value
 
-    _validate_order_dates(po.order_date, po.expected_delivery_date, po.actual_delivery_date)
+    order_date = po.order_date
+    _validate_order_dates(
+        order_date, po.expected_delivery_date, payload.actual_delivery_date
+    )
 
     try:
-        db.commit()
-        db.refresh(po)
-    except IntegrityError:
-        db.rollback()
+        await update_doc(db, "purchase_orders", {"id": purchase_order_id}, values)
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order number already exists",
         )
-    return (
-        db.query(PurchaseOrder)
-        .options(
-            joinedload(PurchaseOrder.vendor), joinedload(PurchaseOrder.contract)
-        )
-        .filter(PurchaseOrder.id == po.id)
-        .first()
-    )
+    return await _get_purchase_order_or_404(db, purchase_order_id)

@@ -1,58 +1,54 @@
-from datetime import date
-from typing import TYPE_CHECKING, Optional
-from sqlalchemy import Boolean, Date, Enum, ForeignKey, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from .base import Base, TimestampMixin
+from datetime import date, datetime
+from typing import ClassVar, Optional
+
+from .base import DocumentModel
 from .enums import VendorStatus
-
-if TYPE_CHECKING:
-    from .contract import Contract
-    from .incident import Incident
-    from .purchase_order import PurchaseOrder
-    from .quality_evaluation import QualityEvaluation
-    from .vendor_category import VendorCategory
+from .vendor_category import VendorCategory
 
 
-class Vendor(Base, TimestampMixin):
-    __tablename__ = "vendors"
+class Vendor(DocumentModel):
+    """Backs the former ``vendors`` table."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    vendor_code: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
-    company_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    contact_person: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    phone: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
-    address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    country: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    website: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    category_id: Mapped[int] = mapped_column(
-        ForeignKey("vendor_categories.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
+    SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "vendor_code",
+        "company_name",
+        "contact_person",
+        "email",
+        "phone",
+        "address",
+        "city",
+        "state",
+        "country",
+        "postal_code",
+        "website",
+        "category_id",
+        "status",
+        "vendor_since",
+        "is_active",
+        "created_at",
+        "updated_at",
     )
-    status: Mapped[VendorStatus] = mapped_column(
-        Enum(VendorStatus, native_enum=False, length=32),
-        nullable=False,
-        default=VendorStatus.PENDING,
-        server_default=VendorStatus.PENDING.value,
-    )
-    vendor_since: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-        server_default="1",
-    )
+    ENUM_FIELDS: ClassVar[dict[str, type]] = {"status": VendorStatus}
+    DATE_FIELDS: ClassVar[set[str]] = {"vendor_since"}
 
-    category: Mapped["VendorCategory"] = relationship(back_populates="vendors")
-    contracts: Mapped[list["Contract"]] = relationship(back_populates="vendor")
-    purchase_orders: Mapped[list["PurchaseOrder"]] = relationship(
-        back_populates="vendor"
-    )
-    quality_evaluations: Mapped[list["QualityEvaluation"]] = relationship(
-        back_populates="vendor"
-    )
-    incidents: Mapped[list["Incident"]] = relationship(back_populates="vendor")
+    id: Optional[int] = None
+    vendor_code: Optional[str] = None
+    company_name: Optional[str] = None
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    postal_code: Optional[str] = None
+    website: Optional[str] = None
+    category_id: Optional[int] = None
+    status: Optional[VendorStatus] = VendorStatus.PENDING
+    vendor_since: Optional[date] = None
+    is_active: Optional[bool] = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    category: Optional[VendorCategory] = None

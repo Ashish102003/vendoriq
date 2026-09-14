@@ -1,8 +1,8 @@
 from datetime import date, timedelta
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from ..db.repository import count_docs, find_docs
 from ..models import Incident, PurchaseOrder, QualityEvaluation, Vendor, VendorCategory
 from ..models.enums import (
     IncidentSeverity,
@@ -70,6 +70,18 @@ def _round1(value: float) -> float:
     return round(value, 1)
 
 
+def _d(value: str | date | None) -> date | None:
+    """Date stored as ISO string -> ``date``."""
+    if value is None:
+        return None
+    return value if isinstance(value, date) else date.fromisoformat(value)
+
+
+def _range(start: date, end: date) -> dict:
+    """ISO-string (lexicographic) inclusive range for a stored date field."""
+    return {"$gte": start.isoformat(), "$lte": end.isoformat()}
+
+
 def resolve_date_range(
     start_date: date | None, end_date: date | None
 ) -> tuple[date, date]:
@@ -131,31 +143,158 @@ def _day_buckets(start: date, end: date) -> list[tuple[str, date, date]]:
     return buckets
 
 
-def scoped_vendors(
-    db: Session, vendor_id: int | None = None, category_id: int | None = None
+async def scoped_vendors(
+    db: AsyncIOMotorDatabase, vendor_id: int | None = None, category_id: int | None = None
 ) -> list[Vendor]:
     """Vendors matching the optional vendor/category filters."""
-    query = db.query(Vendor)
+    criteria: dict = {}
     if vendor_id is not None:
-        query = query.filter(Vendor.id == vendor_id)
+        criteria["id"] = vendor_id
     if category_id is not None:
-        query = query.filter(Vendor.category_id == category_id)
-    return query.all()
+        criteria["category_id"] = category_id
+    return await find_docs(db, "vendors", Vendor, criteria)
 
 
-def _current_unresolved_map(
-    db: Session, vendor_ids: set[int] | None
+# --- Raw row loading helpers --------------------------------------------------
+
+
+async def _delivery_rows(
+    db: AsyncIOMotorDatabase,
+    vendor_ids: set[int] | None,
+    start: date,
+    end: date,
+) -> list[tuple[date, date | None, date]]:
+    criteria: dict = {"order_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        criteria["vendor_id"] = {"$in": list(vendor_ids)}
+    rows = await find_docs(
+        db,
+        "purchase_orders",
+        None,
+        criteria,
+        project={"order_date": 1, "actual_delivery_date": 1, "expected_delivery_date": 1, "_id": 0},
+    )
+    return [
+        (
+            _d(row["order_date"]),
+            _d(row.get("actual_delivery_date")),
+            _d(row["expected_delivery_date"]),
+        )
+        for row in rows
+    ]
+
+
+async def _delivery_rows_vendor(
+    db: AsyncIOMotorDatabase,
+    vendor_ids: set[int] | None,
+    start: date,
+    end: date,
+) -> list[tuple[int, date, date | None, date]]:
+    criteria: dict = {"order_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        criteria["vendor_id"] = {"$in": list(vendor_ids)}
+    rows = await find_docs(
+        db,
+        "purchase_orders",
+        None,
+        criteria,
+        project={
+            "vendor_id": 1,
+            "order_date": 1,
+            "actual_delivery_date": 1,
+            "expected_delivery_date": 1,
+            "_id": 0,
+        },
+    )
+    return [
+        (
+            row["vendor_id"],
+            _d(row["order_date"]),
+            _d(row.get("actual_delivery_date")),
+            _d(row["expected_delivery_date"]),
+        )
+        for row in rows
+    ]
+
+
+async def _quality_rows(
+    db: AsyncIOMotorDatabase,
+    vendor_ids: set[int] | None,
+    start: date,
+    end: date,
+) -> list[tuple[date, int]]:
+    criteria: dict = {"evaluation_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        criteria["vendor_id"] = {"$in": list(vendor_ids)}
+    rows = await find_docs(
+        db,
+        "quality_evaluations",
+        None,
+        criteria,
+        project={"evaluation_date": 1, "quality_score": 1, "_id": 0},
+    )
+    return [(_d(row["evaluation_date"]), row["quality_score"]) for row in rows]
+
+
+async def _quality_rows_vendor(
+    db: AsyncIOMotorDatabase,
+    vendor_ids: set[int] | None,
+    start: date,
+    end: date,
+) -> list[tuple[int, date, int]]:
+    criteria: dict = {"evaluation_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        criteria["vendor_id"] = {"$in": list(vendor_ids)}
+    rows = await find_docs(
+        db,
+        "quality_evaluations",
+        None,
+        criteria,
+        project={"vendor_id": 1, "evaluation_date": 1, "quality_score": 1, "_id": 0},
+    )
+    return [(row["vendor_id"], _d(row["evaluation_date"]), row["quality_score"]) for row in rows]
+
+
+async def _incident_rows(
+    db: AsyncIOMotorDatabase,
+    vendor_ids: set[int] | None,
+    start: date,
+    end: date,
+) -> list[Incident]:
+    criteria: dict = {"reported_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        criteria["vendor_id"] = {"$in": list(vendor_ids)}
+    return await find_docs(db, "incidents", Incident, criteria)
+
+
+async def _current_unresolved_map(
+    db: AsyncIOMotorDatabase, vendor_ids: set[int] | None
 ) -> dict[int, int]:
     """Current (open + in progress) incident counts per vendor."""
-    query = db.query(Incident.vendor_id).filter(
-        Incident.status.in_((IncidentStatus.OPEN, IncidentStatus.IN_PROGRESS))
-    )
-    if vendor_ids is not None:
-        query = query.filter(Incident.vendor_id.in_(vendor_ids))
-    counts: dict[int, int] = {}
-    for (vendor_id,) in query.all():
-        counts[vendor_id] = counts.get(vendor_id, 0) + 1
-    return counts
+    match: dict = {
+        "status": {
+            "$in": [IncidentStatus.OPEN.value, IncidentStatus.IN_PROGRESS.value]
+        }
+    }
+    if vendor_ids is not None and vendor_ids:
+        match["vendor_id"] = {"$in": list(vendor_ids)}
+    pipeline = [{"$match": match}, {"$group": {"_id": "$vendor_id", "count": {"$sum": 1}}}]
+    docs = await db["incidents"].aggregate(pipeline).to_list(None)
+    return {doc["_id"]: doc["count"] for doc in docs}
+
+
+async def _vendor_ids_with_records(
+    db: AsyncIOMotorDatabase, vendor_ids: set[int] | None
+) -> set[int]:
+    """Vendor IDs that have at least one operational record (order, evaluation,
+    or incident) — the definition of "real performance data" for analytics."""
+    if not vendor_ids:
+        return set()
+    criteria = {"vendor_id": {"$in": list(vendor_ids)}}
+    ids: set[int] = set()
+    for collection in ("purchase_orders", "quality_evaluations", "incidents"):
+        ids.update(await db[collection].distinct("vendor_id", criteria))
+    return ids
 
 
 def _build_distribution(
@@ -187,42 +326,22 @@ def _build_distribution(
     ]
 
 
-def _vendor_ids_with_records(
-    db: Session, vendor_ids: set[int] | None
-) -> set[int]:
-    """Vendor IDs that have at least one operational record (order, evaluation,
-    or incident) — the definition of "real performance data" for analytics."""
-    if not vendor_ids:
-        return set()
-    ids: set[int] = set()
-    queries = (
-        db.query(PurchaseOrder.vendor_id).filter(
-            PurchaseOrder.vendor_id.in_(vendor_ids)
-        ),
-        db.query(QualityEvaluation.vendor_id).filter(
-            QualityEvaluation.vendor_id.in_(vendor_ids)
-        ),
-        db.query(Incident.vendor_id).filter(
-            Incident.vendor_id.in_(vendor_ids)
-        ),
-    )
-    for query in queries:
-        ids.update(row[0] for row in query.all())
-    return ids
-
-
-def build_distribution(db: Session, vendors: list[Vendor]) -> PerformanceDistribution:
-    items = [build_performance_list_item(db, vendor) for vendor in vendors]
-    records_set = _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
+async def build_distribution(
+    db: AsyncIOMotorDatabase, vendors: list[Vendor]
+) -> PerformanceDistribution:
+    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
+    records_set = await _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
     return PerformanceDistribution(
         total_vendors=len(items),
         items=_build_distribution(items, records_set),
     )
 
 
-def build_vendor_ranking(db: Session, vendors: list[Vendor]) -> VendorRanking:
-    items = [build_performance_list_item(db, vendor) for vendor in vendors]
-    records_set = _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
+async def build_vendor_ranking(
+    db: AsyncIOMotorDatabase, vendors: list[Vendor]
+) -> VendorRanking:
+    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
+    records_set = await _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
     scored = [
         item
         for item in items
@@ -253,20 +372,10 @@ def build_vendor_ranking(db: Session, vendors: list[Vendor]) -> VendorRanking:
     )
 
 
-def build_delivery_analytics(
-    db: Session, vendor_ids: set[int] | None, start: date, end: date
+async def build_delivery_analytics(
+    db: AsyncIOMotorDatabase, vendor_ids: set[int] | None, start: date, end: date
 ) -> DeliveryAnalytics:
-    query = db.query(
-        PurchaseOrder.order_date,
-        PurchaseOrder.actual_delivery_date,
-        PurchaseOrder.expected_delivery_date,
-    ).filter(
-        PurchaseOrder.order_date >= start,
-        PurchaseOrder.order_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(PurchaseOrder.vendor_id.in_(vendor_ids))
-    rows = query.all()
+    rows = await _delivery_rows(db, vendor_ids, start, end)
     completed = [row for row in rows if row[1] is not None]
     on_time = 0
     delayed = 0
@@ -291,37 +400,30 @@ def build_delivery_analytics(
     )
 
 
-def build_quality_analytics(
-    db: Session, vendor_ids: set[int] | None, start: date, end: date
+async def build_quality_analytics(
+    db: AsyncIOMotorDatabase, vendor_ids: set[int] | None, start: date, end: date
 ) -> QualityAnalytics:
-    query = db.query(
-        func.count(QualityEvaluation.id),
-        func.avg(QualityEvaluation.quality_score),
-    ).filter(
-        QualityEvaluation.evaluation_date >= start,
-        QualityEvaluation.evaluation_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(QualityEvaluation.vendor_id.in_(vendor_ids))
-    total, average = query.one()
-    total = int(total or 0)
-    average_score = _round1(float(average or 0.0)) if total else None
+    match: dict = {"evaluation_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        match["vendor_id"] = {"$in": list(vendor_ids)}
+    pipeline = [
+        {"$match": match},
+        {"$group": {"_id": None, "total": {"$sum": 1}, "average": {"$avg": "$quality_score"}}},
+    ]
+    docs = await db["quality_evaluations"].aggregate(pipeline).to_list(None)
+    total = int(docs[0]["total"]) if docs else 0
+    average = float(docs[0]["average"]) if docs and docs[0].get("average") is not None else 0.0
+    average_score = _round1(average) if total else None
     return QualityAnalytics(
         total_evaluations=total,
         average_quality_score=average_score,
     )
 
 
-def build_incident_analytics(
-    db: Session, vendor_ids: set[int] | None, start: date, end: date
+async def build_incident_analytics(
+    db: AsyncIOMotorDatabase, vendor_ids: set[int] | None, start: date, end: date
 ) -> IncidentAnalytics:
-    query = db.query(Incident).filter(
-        Incident.reported_date >= start,
-        Incident.reported_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(Incident.vendor_id.in_(vendor_ids))
-    incidents = query.all()
+    incidents = await _incident_rows(db, vendor_ids, start, end)
     status_counts: dict[IncidentStatus, int] = {
         IncidentStatus.OPEN: 0,
         IncidentStatus.IN_PROGRESS: 0,
@@ -368,22 +470,6 @@ def build_incident_analytics(
         overdue=overdue,
         resolution_rate=resolution_rate,
     )
-
-
-def _incident_rows_per_month(
-    db: Session,
-    vendor_ids: set[int] | None,
-    start: date,
-    end: date,
-) -> list[Incident]:
-    """Fetch incidents once; used to compute per-period scoring in memory."""
-    query = db.query(Incident).filter(
-        Incident.reported_date >= start,
-        Incident.reported_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(Incident.vendor_id.in_(vendor_ids))
-    return query.all()
 
 
 def _incident_subscore(incidents: list[Incident]) -> IncidentPerformanceSubscore:
@@ -454,25 +540,15 @@ def _period_overall(
     return overall, limited, available
 
 
-def build_delivery_trend(
-    db: Session,
+async def build_delivery_trend(
+    db: AsyncIOMotorDatabase,
     vendors: list[Vendor],
     start: date,
     end: date,
     granularity: str = "monthly",
 ) -> DeliveryTrend:
     vendor_ids = {vendor.id for vendor in vendors}
-    query = db.query(
-        PurchaseOrder.order_date,
-        PurchaseOrder.actual_delivery_date,
-        PurchaseOrder.expected_delivery_date,
-    ).filter(
-        PurchaseOrder.order_date >= start,
-        PurchaseOrder.order_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(PurchaseOrder.vendor_id.in_(vendor_ids))
-    rows = query.all()
+    rows = await _delivery_rows(db, vendor_ids, start, end)
     if granularity == "daily":
         buckets = _day_buckets(start, end)
     else:
@@ -502,7 +578,7 @@ def build_delivery_trend(
                 delivery_score=score,
             )
         )
-    summary = build_delivery_analytics(db, vendor_ids, start, end)
+    summary = await build_delivery_analytics(db, vendor_ids, start, end)
     has_sufficient_data = _has_sufficient_data(points)
     return DeliveryTrend(
         granularity=granularity,
@@ -512,24 +588,15 @@ def build_delivery_trend(
     )
 
 
-def build_quality_trend(
-    db: Session,
+async def build_quality_trend(
+    db: AsyncIOMotorDatabase,
     vendors: list[Vendor],
     start: date,
     end: date,
     granularity: str = "monthly",
 ) -> QualityTrend:
     vendor_ids = {vendor.id for vendor in vendors}
-    query = db.query(
-        QualityEvaluation.evaluation_date,
-        QualityEvaluation.quality_score,
-    ).filter(
-        QualityEvaluation.evaluation_date >= start,
-        QualityEvaluation.evaluation_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(QualityEvaluation.vendor_id.in_(vendor_ids))
-    rows = query.all()
+    rows = await _quality_rows(db, vendor_ids, start, end)
     if granularity == "daily":
         buckets = _day_buckets(start, end)
     else:
@@ -554,7 +621,7 @@ def build_quality_trend(
                 average_score=average,
             )
         )
-    summary = build_quality_analytics(db, vendor_ids, start, end)
+    summary = await build_quality_analytics(db, vendor_ids, start, end)
     return QualityTrend(
         granularity=granularity,
         has_sufficient_data=_has_sufficient_data(points),
@@ -563,15 +630,15 @@ def build_quality_trend(
     )
 
 
-def build_incident_trend(
-    db: Session,
+async def build_incident_trend(
+    db: AsyncIOMotorDatabase,
     vendors: list[Vendor],
     start: date,
     end: date,
     granularity: str = "monthly",
 ) -> IncidentTrend:
     vendor_ids = {vendor.id for vendor in vendors}
-    incidents = _incident_rows_per_month(db, vendor_ids, start, end)
+    incidents = await _incident_rows(db, vendor_ids, start, end)
     if granularity == "daily":
         buckets = _day_buckets(start, end)
     else:
@@ -597,7 +664,7 @@ def build_incident_trend(
                 incident_score=subscore.score,
             )
         )
-    summary = build_incident_analytics(db, vendor_ids, start, end)
+    summary = await build_incident_analytics(db, vendor_ids, start, end)
     return IncidentTrend(
         granularity=granularity,
         has_sufficient_data=_has_sufficient_data(points),
@@ -612,8 +679,8 @@ def _has_sufficient_data(points: list) -> bool:
     return len(points) >= 2 and len(with_data) >= 2
 
 
-def build_performance_trend(
-    db: Session,
+async def build_performance_trend(
+    db: AsyncIOMotorDatabase,
     vendors: list[Vendor],
     start: date,
     end: date,
@@ -621,47 +688,20 @@ def build_performance_trend(
 ) -> PerformanceTrend:
     vendor_ids = {vendor.id for vendor in vendors}
 
-    d_query = db.query(
-        PurchaseOrder.vendor_id,
-        PurchaseOrder.order_date,
-        PurchaseOrder.actual_delivery_date,
-        PurchaseOrder.expected_delivery_date,
-    ).filter(
-        PurchaseOrder.order_date >= start,
-        PurchaseOrder.order_date <= end,
-    )
-    if vendor_ids is not None:
-        d_query = d_query.filter(PurchaseOrder.vendor_id.in_(vendor_ids))
     delivery_by_vendor: dict[int, list] = {}
-    for vendor_id, order_date, actual, expected in d_query.all():
-        delivery_by_vendor.setdefault(vendor_id, []).append(
-            (order_date, actual, expected)
-        )
+    for vendor_id, order_date, actual, expected in await _delivery_rows_vendor(
+        db, vendor_ids, start, end
+    ):
+        delivery_by_vendor.setdefault(vendor_id, []).append((order_date, actual, expected))
 
-    q_query = db.query(
-        QualityEvaluation.vendor_id,
-        QualityEvaluation.evaluation_date,
-        QualityEvaluation.quality_score,
-    ).filter(
-        QualityEvaluation.evaluation_date >= start,
-        QualityEvaluation.evaluation_date <= end,
-    )
-    if vendor_ids is not None:
-        q_query = q_query.filter(QualityEvaluation.vendor_id.in_(vendor_ids))
     quality_by_vendor: dict[int, list] = {}
-    for vendor_id, evaluation_date, quality_score in q_query.all():
-        quality_by_vendor.setdefault(vendor_id, []).append(
-            (evaluation_date, quality_score)
-        )
+    for vendor_id, evaluation_date, quality_score in await _quality_rows_vendor(
+        db, vendor_ids, start, end
+    ):
+        quality_by_vendor.setdefault(vendor_id, []).append((evaluation_date, quality_score))
 
-    i_query = db.query(Incident).filter(
-        Incident.reported_date >= start,
-        Incident.reported_date <= end,
-    )
-    if vendor_ids is not None:
-        i_query = i_query.filter(Incident.vendor_id.in_(vendor_ids))
     incidents_by_vendor: dict[int, list[Incident]] = {}
-    for incident in i_query.all():
+    for incident in await _incident_rows(db, vendor_ids, start, end):
         incidents_by_vendor.setdefault(incident.vendor_id, []).append(incident)
 
     if granularity == "daily":
@@ -718,19 +758,20 @@ def build_performance_trend(
     )
 
 
-def build_incident_severity_distribution(
-    db: Session, vendor_ids: set[int] | None, start: date, end: date
+async def build_incident_severity_distribution(
+    db: AsyncIOMotorDatabase, vendor_ids: set[int] | None, start: date, end: date
 ) -> IncidentSeverityDistribution:
-    query = db.query(Incident.severity, func.count(Incident.id)).filter(
-        Incident.reported_date >= start,
-        Incident.reported_date <= end,
-    )
-    if vendor_ids is not None:
-        query = query.filter(Incident.vendor_id.in_(vendor_ids))
-    query = query.group_by(Incident.severity)
+    match: dict = {"reported_date": _range(start, end)}
+    if vendor_ids is not None and vendor_ids:
+        match["vendor_id"] = {"$in": list(vendor_ids)}
+    pipeline = [
+        {"$match": match},
+        {"$group": {"_id": "$severity", "count": {"$sum": 1}}},
+    ]
+    docs = await db["incidents"].aggregate(pipeline).to_list(None)
     counts: dict[IncidentSeverity, int] = {severity: 0 for severity in IncidentSeverity}
-    for severity, count in query.all():
-        counts[severity] = int(count)
+    for doc in docs:
+        counts[IncidentSeverity(doc["_id"])] = int(doc["count"])
     total = sum(counts.values())
     order = (
         IncidentSeverity.CRITICAL,
@@ -749,11 +790,11 @@ def build_incident_severity_distribution(
     return IncidentSeverityDistribution(total_incidents=total, items=items)
 
 
-def build_category_performance(
-    db: Session, vendors: list[Vendor]
+async def build_category_performance(
+    db: AsyncIOMotorDatabase, vendors: list[Vendor]
 ) -> CategoryPerformance:
-    categories = db.query(VendorCategory).all()
-    records_set = _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
+    categories = await find_docs(db, "vendor_categories", VendorCategory, {})
+    records_set = await _vendor_ids_with_records(db, {vendor.id for vendor in vendors})
     by_category: dict[int, list[Vendor]] = {}
     for vendor in vendors:
         by_category.setdefault(vendor.category_id, []).append(vendor)
@@ -764,7 +805,7 @@ def build_category_performance(
         if not category_vendors:
             continue
         perf_items = [
-            build_performance_list_item(db, vendor) for vendor in category_vendors
+            await build_performance_list_item(db, vendor) for vendor in category_vendors
         ]
         scored = [
             item
@@ -824,18 +865,18 @@ def build_category_performance(
     return CategoryPerformance(total_categories=len(items), items=items)
 
 
-def build_vendor_comparison(
-    db: Session,
+async def build_vendor_comparison(
+    db: AsyncIOMotorDatabase,
     vendors: list[Vendor],
     start: date,
     end: date,
 ) -> VendorComparison:
     metrics: list[VendorComparisonMetric] = []
     for vendor in vendors:
-        detail = build_vendor_performance(db, vendor)
-        delivery = build_delivery_analytics(db, {vendor.id}, start, end)
-        quality = build_quality_analytics(db, {vendor.id}, start, end)
-        incidents = build_incident_analytics(db, {vendor.id}, start, end)
+        detail = await build_vendor_performance(db, vendor)
+        delivery = await build_delivery_analytics(db, {vendor.id}, start, end)
+        quality = await build_quality_analytics(db, {vendor.id}, start, end)
+        incidents = await build_incident_analytics(db, {vendor.id}, start, end)
         metrics.append(
             VendorComparisonMetric(
                 vendor_id=vendor.id,
@@ -1095,16 +1136,16 @@ def _build_insights(
     return insights[:7]
 
 
-def build_overview(
-    db: Session,
+async def build_overview(
+    db: AsyncIOMotorDatabase,
     vendors: list[Vendor],
     start: date,
     end: date,
 ) -> AnalyticsOverview:
     vendor_ids = {vendor.id for vendor in vendors}
-    total_vendors = db.query(func.count(Vendor.id)).scalar() or 0
-    items = [build_performance_list_item(db, vendor) for vendor in vendors]
-    records_set = _vendor_ids_with_records(db, vendor_ids)
+    total_vendors = await count_docs(db, "vendors", {})
+    items = [await build_performance_list_item(db, vendor) for vendor in vendors]
+    records_set = await _vendor_ids_with_records(db, vendor_ids)
     scored = [
         item
         for item in items
@@ -1116,7 +1157,7 @@ def build_overview(
         else None
     )
 
-    unresolved_map = _current_unresolved_map(db, vendor_ids)
+    unresolved_map = await _current_unresolved_map(db, vendor_ids)
     limited_count = 0
     attention = 0
     for item in items:
@@ -1128,49 +1169,26 @@ def build_overview(
         elif unresolved >= 3 or (item.limited_data and unresolved >= 1):
             attention += 1
 
-    delivery = build_delivery_analytics(db, vendor_ids, start, end)
-    quality = build_quality_analytics(db, vendor_ids, start, end)
-    incidents = build_incident_analytics(db, vendor_ids, start, end)
+    delivery = await build_delivery_analytics(db, vendor_ids, start, end)
+    quality = await build_quality_analytics(db, vendor_ids, start, end)
+    incidents = await build_incident_analytics(db, vendor_ids, start, end)
     distribution = _build_distribution(items, records_set)
 
-    d_query = db.query(
-        PurchaseOrder.vendor_id,
-        PurchaseOrder.order_date,
-        PurchaseOrder.actual_delivery_date,
-        PurchaseOrder.expected_delivery_date,
-    ).filter(
-        PurchaseOrder.order_date >= start,
-        PurchaseOrder.order_date <= end,
-    )
-    if vendor_ids is not None:
-        d_query = d_query.filter(PurchaseOrder.vendor_id.in_(vendor_ids))
     delivery_by_vendor: dict[int, list] = {}
-    for vendor_id, order_date, actual, expected in d_query.all():
+    for vendor_id, order_date, actual, expected in await _delivery_rows_vendor(
+        db, vendor_ids, start, end
+    ):
         delivery_by_vendor.setdefault(vendor_id, []).append((order_date, actual, expected))
 
-    q_query = db.query(
-        QualityEvaluation.vendor_id,
-        QualityEvaluation.evaluation_date,
-        QualityEvaluation.quality_score,
-    ).filter(
-        QualityEvaluation.evaluation_date >= start,
-        QualityEvaluation.evaluation_date <= end,
-    )
-    if vendor_ids is not None:
-        q_query = q_query.filter(QualityEvaluation.vendor_id.in_(vendor_ids))
     quality_by_vendor: dict[int, list] = {}
-    for vendor_id, evaluation_date, quality_score in q_query.all():
+    for vendor_id, evaluation_date, quality_score in await _quality_rows_vendor(
+        db, vendor_ids, start, end
+    ):
         quality_by_vendor.setdefault(vendor_id, []).append((evaluation_date, quality_score))
 
-    i_query = db.query(Incident).filter(
-        Incident.reported_date >= start,
-        Incident.reported_date <= end,
-    )
-    if vendor_ids is not None:
-        i_query = i_query.filter(Incident.vendor_id.in_(vendor_ids))
     incidents_by_vendor: dict[int, list[Incident]] = {}
     monthly_counts: dict[str, int] = {}
-    for incident in i_query.all():
+    for incident in await _incident_rows(db, vendor_ids, start, end):
         incidents_by_vendor.setdefault(incident.vendor_id, []).append(incident)
         month_key = f"{incident.reported_date.year:04d}-{incident.reported_date.month:02d}"
         monthly_counts[month_key] = monthly_counts.get(month_key, 0) + 1

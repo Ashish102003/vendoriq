@@ -1,8 +1,8 @@
 from datetime import date
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from ..db.repository import find_docs
 from ..models import Incident, PurchaseOrder, QualityEvaluation, Vendor
 from ..models.enums import IncidentSeverity, IncidentStatus, VendorPerformanceClassification
 from ..models.purchase_order import compute_delivery
@@ -77,6 +77,32 @@ def classify_performance(overall_score: float | None) -> VendorPerformanceClassi
     return VendorPerformanceClassification.CRITICAL
 
 
+def _column_criteria(
+    vendor_id: int | None,
+    start_date: date | None,
+    end_date: date | None,
+    date_field: str,
+) -> dict:
+    """Compile the SQLAlchemy-filter equivalent as a Mongo criteria dict.
+
+    Date-only columns are stored as ``YYYY-MM-DD`` ISO strings so the range
+    comparison is lexicographic and inclusive.
+    """
+    criteria: dict = {}
+    if vendor_id is not None:
+        criteria["vendor_id"] = vendor_id
+    start = start_date.isoformat() if start_date else None
+    end = end_date.isoformat() if end_date else None
+    if start or end:
+        q: dict[str, str] = {}
+        if start:
+            q["$gte"] = start
+        if end:
+            q["$lte"] = end
+        criteria[date_field] = q
+    return criteria
+
+
 def _score_delivery_rows(rows: list[tuple[date | None, date]]) -> tuple:
     """Pure delivery scoring over (actual_delivery_date, expected_delivery_date)."""
     total_orders = len(rows)
@@ -101,8 +127,8 @@ def _score_delivery_rows(rows: list[tuple[date | None, date]]) -> tuple:
     return (score, total_orders, len(completed), on_time, delayed, True)
 
 
-def compute_delivery_score(
-    db: Session,
+async def compute_delivery_score(
+    db: AsyncIOMotorDatabase,
     vendor_id: int | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -118,22 +144,26 @@ def compute_delivery_score(
     ``end_date`` (inclusive, applied to ``order_date``) scope the results to a
     historical period without changing the scoring math.
     """
-    conditions = []
-    if vendor_id is not None:
-        conditions.append(PurchaseOrder.vendor_id == vendor_id)
-    if start_date is not None:
-        conditions.append(PurchaseOrder.order_date >= start_date)
-    if end_date is not None:
-        conditions.append(PurchaseOrder.order_date <= end_date)
-    query = db.query(
-        PurchaseOrder.actual_delivery_date,
-        PurchaseOrder.expected_delivery_date,
+    criteria = _column_criteria(vendor_id, start_date, end_date, "order_date")
+    rows = await find_docs(
+        db,
+        "purchase_orders",
+        None,
+        criteria,
+        project={"actual_delivery_date": 1, "expected_delivery_date": 1, "_id": 0},
     )
-    if conditions:
-        query = query.filter(*conditions)
-    score, total_orders, completed, on_time, delayed, available = _score_delivery_rows(
-        query.all()
-    )
+    pairs = [
+        (
+            date.fromisoformat(row["actual_delivery_date"])
+            if row.get("actual_delivery_date")
+            else None,
+            date.fromisoformat(row["expected_delivery_date"])
+            if row.get("expected_delivery_date")
+            else None,
+        )
+        for row in rows
+    ]
+    score, total_orders, completed, on_time, delayed, available = _score_delivery_rows(pairs)
     return DeliveryPerformanceSubscore(
         score=score,
         total_orders=total_orders,
@@ -152,8 +182,8 @@ def _score_quality_values(values: list[int]) -> tuple[float | None, int]:
     return (_round2(sum(values) / total), total)
 
 
-def compute_quality_score(
-    db: Session,
+async def compute_quality_score(
+    db: AsyncIOMotorDatabase,
     vendor_id: int | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -162,17 +192,15 @@ def compute_quality_score(
 
     ``start_date``/``end_date`` (inclusive) scope records by ``evaluation_date``.
     """
-    conditions = []
-    if vendor_id is not None:
-        conditions.append(QualityEvaluation.vendor_id == vendor_id)
-    if start_date is not None:
-        conditions.append(QualityEvaluation.evaluation_date >= start_date)
-    if end_date is not None:
-        conditions.append(QualityEvaluation.evaluation_date <= end_date)
-    query = db.query(QualityEvaluation.quality_score)
-    if conditions:
-        query = query.filter(*conditions)
-    average, total = _score_quality_values([row[0] for row in query.all()])
+    criteria = _column_criteria(vendor_id, start_date, end_date, "evaluation_date")
+    rows = await find_docs(
+        db,
+        "quality_evaluations",
+        None,
+        criteria,
+        project={"quality_score": 1, "_id": 0},
+    )
+    average, total = _score_quality_values([row["quality_score"] for row in rows])
     return QualityPerformanceSubscore(
         score=average,
         total_evaluations=total,
@@ -239,8 +267,8 @@ def _score_incident_rows(incidents: list[Incident]) -> dict:
     return {"score": score, "counts": counts}
 
 
-def compute_incident_score(
-    db: Session,
+async def compute_incident_score(
+    db: AsyncIOMotorDatabase,
     vendor_id: int | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -253,17 +281,8 @@ def compute_incident_score(
 
     ``start_date``/``end_date`` (inclusive) scope records by ``reported_date``.
     """
-    conditions = []
-    if vendor_id is not None:
-        conditions.append(Incident.vendor_id == vendor_id)
-    if start_date is not None:
-        conditions.append(Incident.reported_date >= start_date)
-    if end_date is not None:
-        conditions.append(Incident.reported_date <= end_date)
-    query = db.query(Incident)
-    if conditions:
-        query = query.filter(*conditions)
-    incidents = query.all()
+    criteria = _column_criteria(vendor_id, start_date, end_date, "reported_date")
+    incidents = await find_docs(db, "incidents", Incident, criteria)
     result = _score_incident_rows(incidents)
     score = result["score"]
     counts = result["counts"]
@@ -428,8 +447,8 @@ def _build_insights(
     return strengths, weaknesses, attention
 
 
-def build_vendor_performance(
-    db: Session,
+async def build_vendor_performance(
+    db: AsyncIOMotorDatabase,
     vendor: Vendor,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -439,9 +458,9 @@ def build_vendor_performance(
     Optional ``start_date``/``end_date`` scope component data to a period
     using the same scoring math (used by historical analytics).
     """
-    delivery = compute_delivery_score(db, vendor.id, start_date, end_date)
-    quality = compute_quality_score(db, vendor.id, start_date, end_date)
-    incidents = compute_incident_score(db, vendor.id, start_date, end_date)
+    delivery = await compute_delivery_score(db, vendor.id, start_date, end_date)
+    quality = await compute_quality_score(db, vendor.id, start_date, end_date)
+    incidents = await compute_incident_score(db, vendor.id, start_date, end_date)
     overall, confidence, limited, available, missing = _combine_scores(
         vendor, delivery, quality, incidents
     )
@@ -475,8 +494,8 @@ def build_vendor_performance(
     )
 
 
-def build_performance_list_item(
-    db: Session,
+async def build_performance_list_item(
+    db: AsyncIOMotorDatabase,
     vendor: Vendor,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -485,7 +504,7 @@ def build_performance_list_item(
 
     ``start_date``/``end_date`` optionally scope component data to a period.
     """
-    detail = build_vendor_performance(db, vendor, start_date, end_date)
+    detail = await build_vendor_performance(db, vendor, start_date, end_date)
     return VendorPerformanceListItem(
         vendor_id=detail.vendor_id,
         vendor_name=detail.vendor_name,
@@ -502,9 +521,9 @@ def build_performance_list_item(
     )
 
 
-def compute_performance_statistics(db: Session) -> VendorPerformanceStatistics:
+async def compute_performance_statistics(db: AsyncIOMotorDatabase) -> VendorPerformanceStatistics:
     """Statistics for the performance dashboard cards (real data only)."""
-    vendors = db.query(Vendor).all()
+    vendors = await find_docs(db, "vendors", Vendor, {})
     counts: dict[VendorPerformanceClassification, int] = {
         VendorPerformanceClassification.EXCELLENT: 0,
         VendorPerformanceClassification.GOOD: 0,
@@ -515,7 +534,7 @@ def compute_performance_statistics(db: Session) -> VendorPerformanceStatistics:
     }
     limited_data = 0
     for vendor in vendors:
-        item = build_performance_list_item(db, vendor)
+        item = await build_performance_list_item(db, vendor)
         counts[item.classification] += 1
         if item.limited_data:
             limited_data += 1

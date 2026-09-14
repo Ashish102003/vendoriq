@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session, joinedload
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from ....core.database import get_db
+from ....db.repository import attach_roles, find_docs
 from ....dependencies.auth import get_current_user
 from ....models import User
 from ....schemas.user_list import UserListItem
@@ -10,16 +11,13 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[UserListItem])
-def list_users(
-    db: Session = Depends(get_db),
+async def list_users(
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    users = (
-        db.query(User)
-        .options(joinedload(User.role))
-        .order_by(User.first_name, User.last_name)
-        .all()
-    )
+    users = await find_docs(db, "users", User, {})
+    await attach_roles(db, users)
+    users.sort(key=lambda u: (u.first_name or "", u.last_name or ""))
     return [
         UserListItem(
             id=user.id,

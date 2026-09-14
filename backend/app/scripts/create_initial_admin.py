@@ -1,18 +1,19 @@
 import sys
-from typing import Optional
+
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from ..core.config import settings
-from ..core.database import SessionLocal
+from ..core.database import get_database
 from ..core.security import hash_password
+from ..db.repository import find_doc, insert_doc
 from ..models import Role, User
 from .seed_roles import seed_roles
 
 
-def create_initial_admin(db=None) -> Optional[User]:
+async def create_initial_admin(
+    db: AsyncIOMotorDatabase | None = None,
+):
     """Create the initial Admin user from env vars. Idempotent."""
-    if SessionLocal is None:
-        raise RuntimeError("Database not configured. Please set DATABASE_URL.")
-
     if not settings.INITIAL_ADMIN_EMAIL or not settings.INITIAL_ADMIN_PASSWORD:
         print(
             "INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD must be set in backend/.env."
@@ -21,22 +22,21 @@ def create_initial_admin(db=None) -> Optional[User]:
 
     owns_session = db is None
     if owns_session:
-        db = SessionLocal()
+        db = await get_database()
 
     try:
         email = settings.INITIAL_ADMIN_EMAIL.lower()
 
-        admin_role = db.query(Role).filter(Role.name == "Admin").first()
+        admin_role = await find_doc(db, "roles", Role, {"name": "Admin"})
         if admin_role is None:
-            seed_roles(db)
-            db.commit()
-            admin_role = db.query(Role).filter(Role.name == "Admin").first()
+            await seed_roles(db)
+            admin_role = await find_doc(db, "roles", Role, {"name": "Admin"})
 
         if admin_role is None:
             print("Admin role is missing; could not create the initial admin.")
             return None
 
-        existing = db.query(User).filter(User.email == email).first()
+        existing = await find_doc(db, "users", User, {"email": email})
         if existing is not None:
             print(f"Initial admin already exists for {email}; skipping.")
             return existing
@@ -49,9 +49,7 @@ def create_initial_admin(db=None) -> Optional[User]:
             role_id=admin_role.id,
             is_active=True,
         )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
+        await insert_doc(db, "users", user)
         print(
             f"Initial admin created: {user.first_name} {user.last_name} "
             f"({user.email}, role={admin_role.name})."
@@ -59,16 +57,18 @@ def create_initial_admin(db=None) -> Optional[User]:
         return user
     finally:
         if owns_session:
-            db.close()
+            db.client.close()
 
 
 def main() -> None:
+    import asyncio
+
     try:
-        create_initial_admin()
+        asyncio.run(create_initial_admin())
     except Exception:
         print(
             "Initial admin creation FAILED. "
-            "Verify that MySQL is running and DATABASE_URL in backend/.env is correct."
+            "Verify that MongoDB Atlas is reachable and MONGODB_URI in backend/.env is correct."
         )
         sys.exit(1)
 

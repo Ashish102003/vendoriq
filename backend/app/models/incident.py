@@ -1,112 +1,67 @@
-from datetime import date
-from typing import TYPE_CHECKING, Optional
+from datetime import date, datetime
+from typing import ClassVar, Optional
 
-from sqlalchemy import (
-    CheckConstraint,
-    Date,
-    Enum,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from .base import Base, TimestampMixin
+from .base import DocumentModel
+from .contract import Contract
 from .enums import IncidentSeverity, IncidentStatus, IncidentType
-
-if TYPE_CHECKING:
-    from .contract import Contract
-    from .purchase_order import PurchaseOrder
-    from .user import User
-    from .vendor import Vendor
+from .purchase_order import PurchaseOrder
+from .user import User
+from .vendor import Vendor
 
 
-class Incident(Base, TimestampMixin):
-    __tablename__ = "incidents"
-    __table_args__ = (
-        CheckConstraint(
-            "impact_score >= 1 AND impact_score <= 10",
-            name="ck_incidents_impact_score_range",
-        ),
-        CheckConstraint(
-            "due_date IS NULL OR due_date >= reported_date",
-            name="ck_incidents_due_date_not_before_reported_date",
-        ),
-        CheckConstraint(
-            "resolved_date IS NULL OR resolved_date >= reported_date",
-            name="ck_incidents_resolved_date_not_before_reported_date",
-        ),
-    )
+class Incident(DocumentModel):
+    """Backs the former ``incidents`` table."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    incident_number: Mapped[str] = mapped_column(
-        String(20),
-        unique=True,
-        nullable=False,
-        index=True,
+    SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "incident_number",
+        "vendor_id",
+        "contract_id",
+        "purchase_order_id",
+        "title",
+        "description",
+        "incident_type",
+        "severity",
+        "status",
+        "reported_date",
+        "due_date",
+        "resolved_date",
+        "impact_score",
+        "reported_by",
+        "assigned_to",
+        "resolution_notes",
+        "created_at",
+        "updated_at",
     )
-    vendor_id: Mapped[int] = mapped_column(
-        ForeignKey("vendors.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    contract_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("contracts.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    purchase_order_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("purchase_orders.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    title: Mapped[str] = mapped_column(String(150), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    incident_type: Mapped[IncidentType] = mapped_column(
-        Enum(IncidentType, native_enum=False, length=32),
-        nullable=False,
-    )
-    severity: Mapped[IncidentSeverity] = mapped_column(
-        Enum(IncidentSeverity, native_enum=False, length=32),
-        nullable=False,
-        index=True,
-    )
-    status: Mapped[IncidentStatus] = mapped_column(
-        Enum(IncidentStatus, native_enum=False, length=32),
-        nullable=False,
-        default=IncidentStatus.OPEN,
-        server_default="OPEN",
-        index=True,
-    )
-    reported_date: Mapped[date] = mapped_column(Date, nullable=False)
-    due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    resolved_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    impact_score: Mapped[int] = mapped_column(Integer, nullable=False)
-    reported_by: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    assigned_to: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("users.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ENUM_FIELDS: ClassVar[dict[str, type]] = {
+        "incident_type": IncidentType,
+        "severity": IncidentSeverity,
+        "status": IncidentStatus,
+    }
+    DATE_FIELDS: ClassVar[set[str]] = {"reported_date", "due_date", "resolved_date"}
 
-    vendor: Mapped["Vendor"] = relationship(back_populates="incidents")
-    contract: Mapped[Optional["Contract"]] = relationship(
-        back_populates="incidents"
-    )
-    purchase_order: Mapped[Optional["PurchaseOrder"]] = relationship(
-        back_populates="incidents"
-    )
-    reported_by_user: Mapped["User"] = relationship(
-        foreign_keys=[reported_by],
-        back_populates="incidents_reported",
-    )
-    assigned_to_user: Mapped[Optional["User"]] = relationship(
-        foreign_keys=[assigned_to],
-        back_populates="incidents_assigned",
-    )
+    id: Optional[int] = None
+    incident_number: Optional[str] = None
+    vendor_id: Optional[int] = None
+    contract_id: Optional[int] = None
+    purchase_order_id: Optional[int] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    incident_type: Optional[IncidentType] = None
+    severity: Optional[IncidentSeverity] = None
+    status: Optional[IncidentStatus] = IncidentStatus.OPEN
+    reported_date: Optional[date] = None
+    due_date: Optional[date] = None
+    resolved_date: Optional[date] = None
+    impact_score: Optional[int] = None
+    reported_by: Optional[int] = None
+    assigned_to: Optional[int] = None
+    resolution_notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    vendor: Optional[Vendor] = None
+    contract: Optional[Contract] = None
+    purchase_order: Optional[PurchaseOrder] = None
+    reported_by_user: Optional[User] = None
+    assigned_to_user: Optional[User] = None

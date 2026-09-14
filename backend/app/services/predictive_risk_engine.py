@@ -15,9 +15,10 @@ zero.
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from ..models import PurchaseOrder, Vendor
+from ..db.repository import count_docs
+from ..models import Vendor
 from ..models.enums import (
     PurchaseOrderStatus,
     RiskConfidence,
@@ -70,33 +71,35 @@ def _plural(noun: str, count: int) -> str:
     return noun if count == 1 else f"{noun}s"
 
 
-def compute_workload_components(
-    db: Session, vendor_id: int, end: date
+async def compute_workload_components(
+    db: AsyncIOMotorDatabase, vendor_id: int, end: date
 ) -> tuple[int, int]:
     """(outstanding_orders, recent_30d_orders) from real purchase orders."""
-    outstanding = (
-        db.query(PurchaseOrder)
-        .filter(
-            PurchaseOrder.vendor_id == vendor_id,
-            PurchaseOrder.status.in_(_ACTIVE_ORDER_STATUSES),
-            PurchaseOrder.order_date <= end,
-        )
-        .count()
+    outstanding = await count_docs(
+        db,
+        "purchase_orders",
+        {
+            "vendor_id": vendor_id,
+            "status": {"$in": [s.value for s in _ACTIVE_ORDER_STATUSES]},
+            "order_date": {"$lte": end.isoformat()},
+        },
     )
-    recent = (
-        db.query(PurchaseOrder)
-        .filter(
-            PurchaseOrder.vendor_id == vendor_id,
-            PurchaseOrder.order_date >= end - timedelta(days=30),
-            PurchaseOrder.order_date <= end,
-        )
-        .count()
+    recent = await count_docs(
+        db,
+        "purchase_orders",
+        {
+            "vendor_id": vendor_id,
+            "order_date": {
+                "$gte": (end - timedelta(days=30)).isoformat(),
+                "$lte": end.isoformat(),
+            },
+        },
     )
     return outstanding, recent
 
 
-def compute_rule_based_components(
-    db: Session,
+async def compute_rule_based_components(
+    db: AsyncIOMotorDatabase,
     vendor: Vendor,
     start: date | None,
     end: date | None,
@@ -106,12 +109,12 @@ def compute_rule_based_components(
     Returns (components, combined_risk_score). The combined score is ``None``
     when no component has data (the record-gating rule).
     """
-    delivery = compute_delivery_score(db, vendor.id, start, end)
-    quality = compute_quality_score(db, vendor.id, start, end)
-    incidents = compute_incident_score(db, vendor.id, start, end)
+    delivery = await compute_delivery_score(db, vendor.id, start, end)
+    quality = await compute_quality_score(db, vendor.id, start, end)
+    incidents = await compute_incident_score(db, vendor.id, start, end)
 
     span_end = end or date.today()
-    outstanding, recent = compute_workload_components(db, vendor.id, span_end)
+    outstanding, recent = await compute_workload_components(db, vendor.id, span_end)
 
     components: dict[str, ComponentRisk] = {}
 
@@ -168,7 +171,7 @@ def compute_rule_based_components(
 
     if any(name in components for name in ("delivery", "quality", "incident")):
         # Overall performance risk mirrors the Phase 7 overall score.
-        overall = _phase7_overall(db, vendor.id, start, end)
+        overall = await _phase7_overall(db, vendor.id, start, end)
         if overall is not None:
             performance_risk = _clamp01(100.0 - overall)
             components["performance"] = ComponentRisk(
@@ -200,15 +203,15 @@ def compute_rule_based_components(
     return components, combined
 
 
-def _phase7_overall(
-    db: Session, vendor_id: int, start: date | None, end: date | None
+async def _phase7_overall(
+    db: AsyncIOMotorDatabase, vendor_id: int, start: date | None, end: date | None
 ) -> float | None:
     """Phase 7 overall performance score (delivery/quality/incident blend)."""
     from .vendor_performance import COMPONENT_WEIGHTS
 
-    delivery = compute_delivery_score(db, vendor_id, start, end)
-    quality = compute_quality_score(db, vendor_id, start, end)
-    incidents = compute_incident_score(db, vendor_id, start, end)
+    delivery = await compute_delivery_score(db, vendor_id, start, end)
+    quality = await compute_quality_score(db, vendor_id, start, end)
+    incidents = await compute_incident_score(db, vendor_id, start, end)
 
     scores: dict[str, float] = {}
     if delivery.data_available and delivery.score is not None:
@@ -325,18 +328,18 @@ def _history_days(vendor: Vendor, today: date) -> int:
     return max(0, (today - anchor).days)
 
 
-def build_rule_based_risk(db: Session, vendor: Vendor) -> RuleBasedResult:
+async def build_rule_based_risk(db: AsyncIOMotorDatabase, vendor: Vendor) -> RuleBasedResult:
     """Full-history rule-based risk profile for ``vendor``."""
     today = date.today()
-    components, combined = compute_rule_based_components(db, vendor, None, None)
+    components, combined = await compute_rule_based_components(db, vendor, None, None)
 
-    delivery = compute_delivery_score(db, vendor.id, None, None)
-    quality = compute_quality_score(db, vendor.id, None, None)
-    incidents = compute_incident_score(db, vendor.id, None, None)
+    delivery = await compute_delivery_score(db, vendor.id, None, None)
+    quality = await compute_quality_score(db, vendor.id, None, None)
+    incidents = await compute_incident_score(db, vendor.id, None, None)
     total_records = delivery.total_orders + quality.total_evaluations + incidents.total_incidents
     history_days = _history_days(vendor, today)
     if history_days == 0:
-        history_days = _earliest_record_span(db, vendor.id, today)
+        history_days = await _earliest_record_span(db, vendor.id, today)
 
     if combined is None:
         return RuleBasedResult(
@@ -361,37 +364,39 @@ def build_rule_based_risk(db: Session, vendor: Vendor) -> RuleBasedResult:
     )
 
 
-def _earliest_record_span(db: Session, vendor_id: int, today: date) -> int:
-    from ..models import Incident, PurchaseOrder, QualityEvaluation
-
+async def _earliest_record_span(
+    db: AsyncIOMotorDatabase, vendor_id: int, today: date
+) -> int:
     anchors: list[date] = []
-    for model, field_name in (
-        (PurchaseOrder, "order_date"),
-        (QualityEvaluation, "evaluation_date"),
-        (Incident, "reported_date"),
+    for collection, field_name in (
+        ("purchase_orders", "order_date"),
+        ("quality_evaluations", "evaluation_date"),
+        ("incidents", "reported_date"),
     ):
-        value = (
-            db.query(getattr(model, field_name))
-            .filter(model.vendor_id == vendor_id, getattr(model, field_name).isnot(None))
-            .order_by(getattr(model, field_name).asc())
-            .first()
+        row = await db[collection].find_one(
+            {field_name: {"$ne": None}, "vendor_id": vendor_id},
+            {field_name: 1, "_id": 0},
         )
-        if value is not None and value[0] is not None:
-            anchors.append(value[0])
+        if row is None:
+            continue
+        value = row.get(field_name)
+        if value is not None:
+            stored = value if isinstance(value, date) else date.fromisoformat(value)
+            anchors.append(stored)
     if not anchors:
         return 0
     return max(0, (today - min(anchors)).days)
 
 
-def compute_risk_trend(db: Session, vendor: Vendor) -> RiskTrend:
+async def compute_risk_trend(db: AsyncIOMotorDatabase, vendor: Vendor) -> RiskTrend:
     """Risk trend from recent vs previous rule-based windows (no fabricated data)."""
     today = date.today()
     window = timedelta(days=risk_config.TREND_WINDOW_DAYS)
     recent_start = today - window
     previous_start = today - (2 * window)
 
-    _, recent = compute_rule_based_components(db, vendor, recent_start, today)
-    _, previous = compute_rule_based_components(
+    _, recent = await compute_rule_based_components(db, vendor, recent_start, today)
+    _, previous = await compute_rule_based_components(
         db, vendor, previous_start, recent_start - timedelta(days=1)
     )
     if recent is None or previous is None:

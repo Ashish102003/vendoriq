@@ -3,19 +3,18 @@
 The model is a ``RandomForestClassifier`` with a deterministic random state.
 It is trained on time-based samples (see ``training_data``) and persisted as a
 Joblib artifact next to a JSON metadata file under ``model_artifacts/``.
-Artifacts are never stored in MySQL and are excluded from the repository.
+Artifacts are never stored in MongoDB and are excluded from the repository.
 
 All functions respect ``risk_config.ARTIFACT_DIR`` at call time so tests can
 redirect storage without touching the real model.
 """
 
 import json
-import math
 from datetime import datetime, timezone
 from pathlib import Path
 
 from joblib import dump, load  # type: ignore[import-not-found]
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
@@ -53,15 +52,15 @@ def _read_metadata() -> dict | None:
         return json.load(handle)
 
 
-def train_model(db: Session) -> TrainingResult:
+async def train_model(db: AsyncIOMotorDatabase) -> TrainingResult:
     """Train (or retrain) the predictive risk model from real records.
 
     Returns a structured ``TrainingResult``. When the underlying dataset is
     too small or lacks class diversity the result reports ``trained=False``
     with a human-readable reason instead of raising.
     """
-    X, y, meta = build_training_dataset(db)
-    viable, row_count, reason = estimate_training_viability(X=X, y=y)
+    X, y, meta = await build_training_dataset(db)
+    viable, row_count, reason = await estimate_training_viability(X=X, y=y)
     if not viable:
         return TrainingResult(
             trained=False,
@@ -146,7 +145,7 @@ def get_model_info() -> ModelInfo:
     )
 
 
-def predict_ml(db: Session, vendor_id: int) -> float | None:
+async def predict_ml(db: AsyncIOMotorDatabase, vendor_id: int) -> float | None:
     """Predictive risk score (0-100) for ``vendor_id`` from the trained model.
 
     Returns ``None`` when no model exists or the vendor has no month with
@@ -159,7 +158,7 @@ def predict_ml(db: Session, vendor_id: int) -> float | None:
         return None
     model, metadata = loaded
 
-    features = latest_period_features(db, vendor_id)
+    features = await latest_period_features(db, vendor_id)
     if features is None:
         return None
 

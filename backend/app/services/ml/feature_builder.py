@@ -9,20 +9,16 @@ being "filled in", so missing data is never fabricated.
 
 from datetime import date
 
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from ...models import Contract, Incident, PurchaseOrder, QualityEvaluation, Vendor
+from ...db.repository import count_docs, find_doc, find_docs
+from ...models import Contract, Incident, Vendor
 from ...models.enums import (
     ContractStatus,
     IncidentSeverity,
     IncidentStatus,
     PurchaseOrderStatus,
     VendorPerformanceClassification,
-)
-from ...schemas.vendor_performance import (
-    DeliveryPerformanceSubscore,
-    IncidentPerformanceSubscore,
-    QualityPerformanceSubscore,
 )
 from ..vendor_performance import (  # noqa: WPS437 -- intentional same-package reuse
     _score_delivery_rows,
@@ -92,6 +88,12 @@ def _round2(value: float) -> float:
     return round(value, 2)
 
 
+def _d(value) -> date | None:
+    if value is None:
+        return None
+    return value if isinstance(value, date) else date.fromisoformat(value)
+
+
 def _quality_trend(values: list[tuple[date, int]]) -> float:
     """Slope of quality score over time (or 0 when fewer than 2 points)."""
     if len(values) < 2:
@@ -108,13 +110,8 @@ def _quality_trend(values: list[tuple[date, int]]) -> float:
     return _round2(cov / var)
 
 
-def _elapsed_months(start: date, end: date) -> float:
-    days = max(1, (end - start).days)
-    return max(1.0, days / 30.44)
-
-
-def build_period_features(
-    db: Session,
+async def build_period_features(
+    db: AsyncIOMotorDatabase,
     vendor_id: int,
     start: date | None,
     end: date | None,
@@ -124,46 +121,52 @@ def build_period_features(
     ``start``/``end`` of ``None`` scope the vector to the full record history
     (equivalent to all recorded data).
     """
-    conditions = [PurchaseOrder.vendor_id == vendor_id]
+    po_criteria = {"vendor_id": vendor_id}
     if start is not None:
-        conditions.append(PurchaseOrder.order_date >= start)
+        po_criteria.setdefault("order_date", {})["$gte"] = start.isoformat()
     if end is not None:
-        conditions.append(PurchaseOrder.order_date <= end)
-    delivery_rows = (
-        db.query(
-            PurchaseOrder.actual_delivery_date,
-            PurchaseOrder.expected_delivery_date,
-        )
-        .filter(*conditions)
-        .all()
+        po_criteria.setdefault("order_date", {})["$lte"] = end.isoformat()
+    delivery_rows_raw = await find_docs(
+        db,
+        "purchase_orders",
+        None,
+        po_criteria,
+        project={"actual_delivery_date": 1, "expected_delivery_date": 1, "_id": 0},
     )
-
-    q_conditions = [QualityEvaluation.vendor_id == vendor_id]
-    if start is not None:
-        q_conditions.append(QualityEvaluation.evaluation_date >= start)
-    if end is not None:
-        q_conditions.append(QualityEvaluation.evaluation_date <= end)
-    quality_rows = (
-        db.query(
-            QualityEvaluation.evaluation_date,
-            QualityEvaluation.quality_score,
+    delivery_rows = [
+        (
+            _d(row.get("actual_delivery_date")),
+            _d(row["expected_delivery_date"]),
         )
-        .filter(*q_conditions)
-        .all()
-    )
+        for row in delivery_rows_raw
+    ]
 
-    i_conditions = [Incident.vendor_id == vendor_id]
+    q_criteria = {"vendor_id": vendor_id}
     if start is not None:
-        i_conditions.append(Incident.reported_date >= start)
+        q_criteria.setdefault("evaluation_date", {})["$gte"] = start.isoformat()
     if end is not None:
-        i_conditions.append(Incident.reported_date <= end)
-    incidents = db.query(Incident).filter(*i_conditions).all()
+        q_criteria.setdefault("evaluation_date", {})["$lte"] = end.isoformat()
+    quality_rows_raw = await find_docs(
+        db,
+        "quality_evaluations",
+        None,
+        q_criteria,
+        project={"evaluation_date": 1, "quality_score": 1, "_id": 0},
+    )
+    quality_rows = [(_d(row["evaluation_date"]), row["quality_score"]) for row in quality_rows_raw]
+
+    i_criteria = {"vendor_id": vendor_id}
+    if start is not None:
+        i_criteria.setdefault("reported_date", {})["$gte"] = start.isoformat()
+    if end is not None:
+        i_criteria.setdefault("reported_date", {})["$lte"] = end.isoformat()
+    incidents = await find_docs(db, "incidents", Incident, i_criteria)
 
     delivery_score, total_orders, completed, _, delayed, _ = _score_delivery_rows(
         delivery_rows
     )
     avg_quality, total_quality = _score_quality_values(
-        [row[1] for row in quality_rows]
+        [score for _, score in quality_rows]
     )
     incident_result = _score_incident_rows(incidents)
 
@@ -196,13 +199,11 @@ def build_period_features(
     # Contracts as of period end.
     as_of = end or date.today()
     from_start = start or date(1970, 1, 1)
-    contracts = (
-        db.query(Contract)
-        .filter(
-            Contract.vendor_id == vendor_id,
-            Contract.start_date <= as_of,
-        )
-        .all()
+    contracts = await find_docs(
+        db,
+        "contracts",
+        Contract,
+        {"vendor_id": vendor_id, "start_date": {"$lte": as_of.isoformat()}},
     )
     active_contracts = sum(
         1
@@ -213,14 +214,14 @@ def build_period_features(
     )
 
     # Outstanding orders as of period end + orders placed in the period.
-    outstanding = (
-        db.query(PurchaseOrder)
-        .filter(
-            PurchaseOrder.vendor_id == vendor_id,
-            PurchaseOrder.status.in_(_ACTIVE_ORDER_STATUSES),
-            PurchaseOrder.order_date <= as_of,
-        )
-        .count()
+    outstanding = await count_docs(
+        db,
+        "purchase_orders",
+        {
+            "vendor_id": vendor_id,
+            "status": {"$in": [s.value for s in _ACTIVE_ORDER_STATUSES]},
+            "order_date": {"$lte": as_of.isoformat()},
+        },
     )
     recent_order_volume = total_orders
 
@@ -239,15 +240,15 @@ def build_period_features(
 
     # Record history span for confidence-related features.
     history_span = 0.0
-    vendor = db.get(Vendor, vendor_id)
+    vendor = await find_doc(db, "vendors", Vendor, {"id": vendor_id})
     if vendor is not None:
         anchor = vendor.vendor_since
         if anchor is None:
-            dates = [
-                row[0] for row in quality_rows
-            ] + [incident.reported_date for incident in incidents] + [
-                row[1] for row in delivery_rows if row[1] is not None
-            ]
+            dates = (
+                [eval_date for eval_date, _ in quality_rows]
+                + [incident.reported_date for incident in incidents]
+                + [actual for actual, _ in delivery_rows if actual is not None]
+            )
             if dates:
                 anchor = min(dates)
         if anchor is not None:
@@ -268,7 +269,7 @@ def build_period_features(
         # Quality
         "total_quality_evaluations": float(total_quality),
         "average_quality_score": float(avg_quality or 0.0),
-        "lowest_quality_score": float(min([row[1] for row in quality_rows], default=0)),
+        "lowest_quality_score": float(min([score for _, score in quality_rows], default=0)),
         "quality_score_trend": _quality_trend(quality_rows),
         # Incidents
         "total_incidents": float(len(incidents)),
@@ -312,9 +313,11 @@ def build_period_features(
     return features
 
 
-def build_vendor_features(db: Session, vendor_id: int) -> dict[str, float]:
+async def build_vendor_features(
+    db: AsyncIOMotorDatabase, vendor_id: int
+) -> dict[str, float]:
     """Feature vector for ``vendor_id`` over its full recorded history."""
-    return build_period_features(db, vendor_id, None, None)
+    return await build_period_features(db, vendor_id, None, None)
 
 
 def feature_vector(features: dict[str, float]) -> list[float]:

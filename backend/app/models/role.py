@@ -1,17 +1,22 @@
-from typing import TYPE_CHECKING, Optional
-from sqlalchemy import String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from .base import Base, TimestampMixin
+from datetime import datetime
+from typing import ClassVar, Optional
 
-if TYPE_CHECKING:
-    from .user import User
+from .base import DocumentModel
 
 
-class Role(Base, TimestampMixin):
-    __tablename__ = "roles"
+class Role(DocumentModel):
+    """Backs the former ``roles`` table."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "id",
+        "name",
+        "description",
+        "created_at",
+        "updated_at",
+    )
 
-    users: Mapped[list["User"]] = relationship(back_populates="role")
+    id: Optional[int] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None

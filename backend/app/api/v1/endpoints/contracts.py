@@ -3,11 +3,20 @@ from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 
 from ....core.database import get_db
+from ....db.repository import (
+    attach_vendors,
+    cis,
+    contains,
+    count_docs,
+    find_doc,
+    find_docs,
+    insert_doc,
+    update_doc,
+)
 from ....dependencies.auth import get_current_user, require_roles
 from ....models import Contract, User, Vendor
 from ....models.enums import ContractStatus
@@ -24,47 +33,43 @@ router = APIRouter()
 
 CONTRACT_EDITOR_ROLES = ("Admin", "Vendor Manager", "Procurement Manager")
 
-SORT_FIELDS: dict[str, object] = {
-    "contract_number": Contract.contract_number,
-    "title": Contract.title,
-    "contract_value": Contract.contract_value,
-    "start_date": Contract.start_date,
-    "end_date": Contract.end_date,
-    "status": Contract.status,
-    "created_at": Contract.created_at,
-    "updated_at": Contract.updated_at,
+SORT_FIELDS: dict[str, str] = {
+    "contract_number": "contract_number",
+    "title": "title",
+    "contract_value": "contract_value",
+    "start_date": "start_date",
+    "end_date": "end_date",
+    "status": "status",
+    "created_at": "created_at",
+    "updated_at": "updated_at",
 }
 SORT_ORDER = Literal["asc", "desc"]
 
 
-def _get_contract_or_404(db: Session, contract_id: int) -> Contract:
-    contract = (
-        db.query(Contract)
-        .options(joinedload(Contract.vendor))
-        .filter(Contract.id == contract_id)
-        .first()
-    )
+async def _get_contract_or_404(
+    db: AsyncIOMotorDatabase, contract_id: int
+) -> Contract:
+    contract = await find_doc(db, "contracts", Contract, {"id": contract_id})
     if contract is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Contract not found",
         )
+    await attach_vendors(db, [contract])
     return contract
 
 
-def _contract_number_exists(
-    db: Session, contract_number: str, exclude_id: int | None = None
+async def _contract_number_exists(
+    db: AsyncIOMotorDatabase, contract_number: str, exclude_id: int | None = None
 ) -> bool:
-    query = db.query(Contract).filter(
-        func.lower(Contract.contract_number) == contract_number.lower()
-    )
+    criteria: dict = {"contract_number": cis(contract_number)}
     if exclude_id is not None:
-        query = query.filter(Contract.id != exclude_id)
-    return query.first() is not None
+        criteria["id"] = {"$ne": exclude_id}
+    return await find_doc(db, "contracts", Contract, criteria) is not None
 
 
 def _validate_contract_dates(start_date, end_date) -> None:
-    if end_date < start_date:
+    if start_date and end_date and end_date < start_date:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="end_date must be on or after start_date",
@@ -72,34 +77,37 @@ def _validate_contract_dates(start_date, end_date) -> None:
 
 
 @router.get("/statistics", response_model=ContractStatistics)
-def get_contract_statistics(
-    db: Session = Depends(get_db),
+async def get_contract_statistics(
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    total = db.query(func.count(Contract.id)).scalar() or 0
-    status_counts = {
-        row_status: count
-        for row_status, count in db.query(
-            Contract.status, func.count(Contract.id)
-        )
-        .group_by(Contract.status)
-        .all()
-    }
-    total_value = db.query(func.sum(Contract.contract_value)).scalar()
+    total = await count_docs(db, "contracts", {})
+    status_rows = await db["contracts"].aggregate(
+        [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+    ).to_list(None)
+    status_counts = {row["_id"]: row["count"] for row in status_rows}
+    value_rows = await db["contracts"].aggregate(
+        [
+            {"$group": {"_id": None, "total": {"$sum": "$contract_value"}}},
+        ]
+    ).to_list(None)
+    total_value = value_rows[0]["total"] if value_rows else Decimal("0")
+    if total_value != Decimal("0"):
+        total_value = total_value.to_decimal() if hasattr(total_value, "to_decimal") else Decimal(str(total_value))
     return ContractStatistics(
         total_contracts=total,
-        active_contracts=status_counts.get(ContractStatus.ACTIVE, 0),
-        draft_contracts=status_counts.get(ContractStatus.DRAFT, 0),
-        completed_contracts=status_counts.get(ContractStatus.COMPLETED, 0),
-        on_hold_contracts=status_counts.get(ContractStatus.ON_HOLD, 0),
-        cancelled_contracts=status_counts.get(ContractStatus.CANCELLED, 0),
-        expired_contracts=status_counts.get(ContractStatus.EXPIRED, 0),
-        total_contract_value=total_value or Decimal("0"),
+        active_contracts=status_counts.get(ContractStatus.ACTIVE.value, 0),
+        draft_contracts=status_counts.get(ContractStatus.DRAFT.value, 0),
+        completed_contracts=status_counts.get(ContractStatus.COMPLETED.value, 0),
+        on_hold_contracts=status_counts.get(ContractStatus.ON_HOLD.value, 0),
+        cancelled_contracts=status_counts.get(ContractStatus.CANCELLED.value, 0),
+        expired_contracts=status_counts.get(ContractStatus.EXPIRED.value, 0),
+        total_contract_value=total_value,
     )
 
 
 @router.get("", response_model=PaginatedContracts)
-def list_contracts(
+async def list_contracts(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
     search: str | None = Query(default=None, max_length=100),
@@ -117,49 +125,42 @@ def list_contracts(
         "updated_at",
     ] = "created_at",
     sort_order: SORT_ORDER = "desc",
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    conditions = []
+    criteria: dict = {}
     if search:
         term = search.strip()
         if term:
-            like = f"%{term}%"
-            conditions.append(
-                or_(
-                    Contract.contract_number.ilike(like),
-                    Contract.title.ilike(like),
-                )
-            )
+            pattern = contains(term)
+            criteria["$or"] = [
+                {"contract_number": pattern},
+                {"title": pattern},
+            ]
     if vendor_id is not None:
-        conditions.append(Contract.vendor_id == vendor_id)
+        criteria["vendor_id"] = vendor_id
     if status_filter is not None:
-        conditions.append(Contract.status == status_filter)
+        criteria["status"] = status_filter.value
     if is_active is not None:
-        conditions.append(Contract.is_active.is_(is_active))
+        criteria["is_active"] = is_active
 
-    base = db.query(Contract)
-    if conditions:
-        base = base.filter(*conditions)
-    total = base.count() or 0
+    total = await count_docs(db, "contracts", criteria)
 
-    items_query = db.query(Contract).options(joinedload(Contract.vendor))
-    if conditions:
-        items_query = items_query.filter(*conditions)
-
-    order_column: object = SORT_FIELDS[sort_by]
-    if sort_order == "desc":
-        order_column = order_column.desc()
-    items = (
-        items_query.order_by(order_column)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
+    sort = [(SORT_FIELDS[sort_by], 1 if sort_order == "asc" else -1)]
+    contracts = await find_docs(
+        db,
+        "contracts",
+        Contract,
+        criteria,
+        sort=sort,
+        skip=(page - 1) * page_size,
+        limit=page_size,
     )
+    await attach_vendors(db, contracts)
 
     total_pages = math.ceil(total / page_size) if total else 0
     return {
-        "items": items,
+        "items": contracts,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -172,12 +173,12 @@ def list_contracts(
     response_model=ContractDetailResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_contract(
+async def create_contract(
     payload: ContractCreate,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*CONTRACT_EDITOR_ROLES)),
 ):
-    vendor = db.get(Vendor, payload.vendor_id)
+    vendor = await find_doc(db, "vendors", Vendor, {"id": payload.vendor_id})
     if vendor is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -185,11 +186,13 @@ def create_contract(
         )
 
     contract_number = payload.contract_number.strip().upper()
-    if _contract_number_exists(db, contract_number):
+    if await _contract_number_exists(db, contract_number):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Contract number already exists",
         )
+
+    _validate_contract_dates(payload.start_date, payload.end_date)
 
     contract = Contract(
         vendor_id=vendor.id,
@@ -203,35 +206,33 @@ def create_contract(
         is_active=payload.is_active,
     )
     try:
-        db.add(contract)
-        db.commit()
-        db.refresh(contract)
-    except IntegrityError:
-        db.rollback()
+        await insert_doc(db, "contracts", contract)
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Contract number already exists",
         )
+    await attach_vendors(db, [contract])
     return contract
 
 
 @router.get("/{contract_id}", response_model=ContractDetailResponse)
-def get_contract(
+async def get_contract(
     contract_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return _get_contract_or_404(db, contract_id)
+    return await _get_contract_or_404(db, contract_id)
 
 
 @router.patch("/{contract_id}", response_model=ContractDetailResponse)
-def update_contract(
+async def update_contract(
     contract_id: int,
     payload: ContractUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*CONTRACT_EDITOR_ROLES)),
 ):
-    contract = _get_contract_or_404(db, contract_id)
+    await _get_contract_or_404(db, contract_id)
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -241,13 +242,12 @@ def update_contract(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Vendor is required",
             )
-        vendor = db.get(Vendor, data["vendor_id"])
+        vendor = await find_doc(db, "vendors", Vendor, {"id": data["vendor_id"]})
         if vendor is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Vendor not found",
             )
-        contract.vendor_id = data["vendor_id"]
 
     if "contract_number" in data:
         new_number = (data["contract_number"] or "").strip().upper()
@@ -256,12 +256,12 @@ def update_contract(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Contract number is required",
             )
-        if _contract_number_exists(db, new_number, exclude_id=contract.id):
+        if await _contract_number_exists(db, new_number, exclude_id=contract_id):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Contract number already exists",
             )
-        contract.contract_number = new_number
+        data["contract_number"] = new_number
 
     if "title" in data:
         title = (data["title"] or "").strip()
@@ -270,7 +270,7 @@ def update_contract(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Title is required",
             )
-        contract.title = title
+        data["title"] = title
 
     if "contract_value" in data:
         if data["contract_value"] is None:
@@ -278,50 +278,51 @@ def update_contract(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Contract value is required",
             )
-        contract.contract_value = data["contract_value"]
 
-    if "start_date" in data:
-        contract.start_date = data["start_date"]
-    if "end_date" in data:
-        contract.end_date = data["end_date"]
-    if contract.end_date < contract.start_date:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="end_date must be on or after start_date",
-        )
+    if "end_date" in data and data["end_date"] is not None:
+        _validate_contract_dates(data.get("start_date"), data["end_date"])
 
-    for field in ("description", "status", "is_active"):
-        if field in data:
-            setattr(contract, field, data[field])
+    update_fields = {
+        "vendor_id",
+        "contract_number",
+        "title",
+        "description",
+        "contract_value",
+        "start_date",
+        "end_date",
+        "status",
+        "is_active",
+    }
+    values = {field: data[field] for field in update_fields & set(data)}
 
     try:
-        db.commit()
-        db.refresh(contract)
-    except IntegrityError:
-        db.rollback()
+        await update_doc(db, "contracts", {"id": contract_id}, values)
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Contract number already exists",
         )
-    return contract
+    return await _get_contract_or_404(db, contract_id)
 
 
 @router.patch("/{contract_id}/status", response_model=ContractDetailResponse)
-def update_contract_status(
+async def update_contract_status(
     contract_id: int,
     payload: ContractStatusUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     current_user: User = Depends(require_roles(*CONTRACT_EDITOR_ROLES)),
 ):
-    contract = _get_contract_or_404(db, contract_id)
-    contract.status = payload.status
+    await _get_contract_or_404(db, contract_id)
     try:
-        db.commit()
-        db.refresh(contract)
-    except IntegrityError:
-        db.rollback()
+        await update_doc(
+            db,
+            "contracts",
+            {"id": contract_id},
+            {"status": payload.status.value},
+        )
+    except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Contract number already exists",
         )
-    return contract
+    return await _get_contract_or_404(db, contract_id)

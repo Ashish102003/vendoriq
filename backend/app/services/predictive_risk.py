@@ -8,8 +8,9 @@ the response says so explicitly.
 
 from datetime import datetime, timezone
 
-from sqlalchemy.orm import Session
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from ..db.repository import attach_categories, find_docs
 from ..models import Vendor
 from ..models.enums import (
     PredictionMethod,
@@ -58,12 +59,12 @@ def _model_info() -> ModelInfo:
     return info
 
 
-def build_predictive_risk(db: Session, vendor: Vendor) -> PredictiveRisk:
+async def build_predictive_risk(db: AsyncIOMotorDatabase, vendor: Vendor) -> PredictiveRisk:
     """Full predictive risk response for a single vendor."""
-    rule = build_rule_based_risk(db, vendor)
+    rule = await build_rule_based_risk(db, vendor)
     generated_at = datetime.now(timezone.utc)
     model_info = _model_info()
-    trend = compute_risk_trend(db, vendor)
+    trend = await compute_risk_trend(db, vendor)
 
     if rule.risk_score is None:
         return PredictiveRisk(
@@ -83,7 +84,7 @@ def build_predictive_risk(db: Session, vendor: Vendor) -> PredictiveRisk:
             generated_at=generated_at,
         )
 
-    ml_score = predict_ml(db, vendor.id) if model_info.available else None
+    ml_score = await predict_ml(db, vendor.id) if model_info.available else None
     method = PredictionMethod.RULE_BASED
     risk_score = rule.risk_score
     detail: str | None = None
@@ -115,9 +116,9 @@ def build_predictive_risk(db: Session, vendor: Vendor) -> PredictiveRisk:
     )
 
 
-def _build_list_item(db: Session, vendor: Vendor) -> VendorRiskListItem:
-    risk = build_predictive_risk(db, vendor)
-    overall = _phase7_overall(db, vendor.id, None, None)
+async def _build_list_item(db: AsyncIOMotorDatabase, vendor: Vendor) -> VendorRiskListItem:
+    risk = await build_predictive_risk(db, vendor)
+    overall = await _phase7_overall(db, vendor.id, None, None)
     category_name = vendor.category.name if vendor.category else None
     return VendorRiskListItem(
         vendor_id=risk.vendor_id,
@@ -140,8 +141,8 @@ def _sort_value(item: VendorRiskListItem, sort_by: str):
     return item.risk_score
 
 
-def build_risk_list(
-    db: Session,
+async def build_risk_list(
+    db: AsyncIOMotorDatabase,
     search: str | None = None,
     category_id: int | None = None,
     risk_level: RiskLevel | None = None,
@@ -156,18 +157,21 @@ def build_risk_list(
     the score is computed). ``None`` scores always sort last regardless of the
     sort direction so the list never hides data.
     """
-    query = db.query(Vendor)
+    criteria: dict = {}
     if search:
-        pattern = f"%{search}%"
-        query = query.filter(
-            Vendor.company_name.ilike(pattern)
-            | Vendor.vendor_code.ilike(pattern)
-        )
-    if category_id is not None:
-        query = query.filter(Vendor.category_id == category_id)
+        import re
 
-    vendors = query.all()
-    items = [_build_list_item(db, vendor) for vendor in vendors]
+        pattern = {"$regex": re.escape(search), "$options": "i"}
+        criteria["$or"] = [
+            {"company_name": pattern},
+            {"vendor_code": pattern},
+        ]
+    if category_id is not None:
+        criteria["category_id"] = category_id
+
+    vendors = await find_docs(db, "vendors", Vendor, criteria)
+    await attach_categories(db, vendors)
+    items = [await _build_list_item(db, vendor) for vendor in vendors]
 
     if risk_level is not None:
         items = [item for item in items if item.risk_level == risk_level]
@@ -201,10 +205,11 @@ def build_risk_list(
     )
 
 
-def build_risk_statistics(db: Session) -> RiskStatistics:
+async def build_risk_statistics(db: AsyncIOMotorDatabase) -> RiskStatistics:
     """Summary card statistics computed from every vendor's real risk data."""
-    vendors = db.query(Vendor).all()
-    items = [_build_list_item(db, vendor) for vendor in vendors]
+    vendors = await find_docs(db, "vendors", Vendor, {})
+    await attach_categories(db, vendors)
+    items = [await _build_list_item(db, vendor) for vendor in vendors]
 
     stats = RiskStatistics(total_vendors=len(items))
     scored = []
