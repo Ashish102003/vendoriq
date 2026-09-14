@@ -5,7 +5,8 @@ import {
 } from '../auth/token'
 
 export const API_BASE_URL: string =
-  import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+  import.meta.env.VITE_API_BASE_URL ??
+  (import.meta.env.DEV ? 'http://localhost:8000' : '')
 
 export class ApiError extends Error {
   override name: string = 'ApiError'
